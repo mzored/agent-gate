@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -25,6 +27,7 @@ GRACE_SECONDS = 5.0
 START_TOLERANCE_SECONDS = 1
 # Give a process in exec time to make its arguments readable.
 EXEC_SECONDS = 1.0
+# By absolute path: callers' PATH often leaves out /usr/sbin.
 LSOF = "/usr/sbin/lsof"
 
 _LIBC = ctypes.CDLL(None, use_errno=True)
@@ -369,23 +372,47 @@ def free_share(stats: "_VmStatistics64", total_pages: Optional[int]) -> Optional
     return min(100, free * 100 // total_pages)
 
 
-#: (monotonic time, bytes swapped out since boot) seen by this process, oldest first.
-_SWAP_SAMPLES: List[Tuple[float, int]] = []
+def _readings(samples: Path) -> List[Tuple[float, int]]:
+    try:
+        value = json.loads(samples.read_text())
+        return [(float(at), int(swapped)) for at, swapped in value]
+    except (OSError, ValueError, TypeError):
+        return []
 
 
-def swapout_rate(swapped_out: int) -> Optional[float]:
-    """MiB/s swapped out over the last SWAP_WINDOW_SECONDS this process watched; None until it watched
-    SWAP_MIN_SECONDS. A waiter polls, so it measures the rate before it may start a run beside others."""
-    now = time.monotonic()
-    _SWAP_SAMPLES.append((now, swapped_out))
-    while len(_SWAP_SAMPLES) > 2 and now - _SWAP_SAMPLES[1][0] >= SWAP_WINDOW_SECONDS:
-        del _SWAP_SAMPLES[0]
-    then, before = _SWAP_SAMPLES[0]
+def swapout_rate(swapped_out: int, samples: Path) -> Optional[float]:
+    """MiB/s swapped out over about the last SWAP_WINDOW_SECONDS; None until readings SWAP_MIN_SECONDS apart exist.
+
+    Every gate on the host adds its readings to `samples`, so one that has just started
+    sees the rate the others measured; a waiter polls and a running gate samples, so
+    while runs run the readings stay fresh.
+    """
+    now = time.time()
+    # A reading from the future was taken before a clock was set back.
+    readings = [reading for reading in _readings(samples) if reading[0] <= now]
+    newest = readings[-1][0] if readings else -math.inf
+    readings.append((now, swapped_out))
+    while len(readings) > 2 and now - readings[1][0] >= SWAP_WINDOW_SECONDS:
+        del readings[0]
+    if now - readings[0][0] > 2 * SWAP_WINDOW_SECONDS:
+        readings = readings[-1:]  # an average over a quiet stretch says nothing about now
+    if now - newest >= SWAP_MIN_SECONDS / 2:
+        staging = samples.with_name(f".{samples.name}.{os.getpid()}.tmp")
+        try:
+            staging.write_text(json.dumps(readings))
+            os.replace(staging, samples)
+        except OSError:
+            with contextlib.suppress(OSError):
+                staging.unlink()
+    then, before = readings[0]
     return None if now - then < SWAP_MIN_SECONDS else max(0, swapped_out - before) / (now - then) / 2**20
 
 
-def memory_signal(environ: Mapping[str, str]) -> Tuple[Optional[int], Optional[int], Optional[float]]:
+def memory_signal(environ: Mapping[str, str],
+                  samples: Path) -> Tuple[Optional[int], Optional[int], Optional[float]]:
     """(pressure level, free percent, swap-out MiB/s); each is None when unreadable here or not yet measured.
+
+    `samples` keeps the host's recent swap-out readings (see `swapout_rate`).
 
     The pressure level is unreadable inside the Codex sandbox.
     """
@@ -402,7 +429,7 @@ def memory_signal(environ: Mapping[str, str]) -> Tuple[Optional[int], Optional[i
     if _host_statistics64(_host_port, _HOST_VM_INFO64, ctypes.byref(stats), ctypes.byref(count)) != 0:
         return sysctl_int("kern.memorystatus_vm_pressure_level"), None, None
     return (sysctl_int("kern.memorystatus_vm_pressure_level"), free_share(stats, _MEMORY_PAGES),
-            swapout_rate(stats.swapouts * _PAGE_BYTES))
+            swapout_rate(stats.swapouts * _PAGE_BYTES, samples))
 
 
 #: (busy counters, idle counters, the modulus they wrap at)

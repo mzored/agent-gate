@@ -1,24 +1,16 @@
 #!/usr/bin/env python3
 """agent-gate: run a heavy command when this machine has room for it.
 
-Many agents share one Mac. Each gated command declares k CPU tokens, of which
-it holds at most half of T (AGENT_GATE_MAX_CLAIM); running commands never hold
-more than T tokens together (T = logical CPUs), but for a few tokens of headroom
-only 1-token commands may take (AGENT_GATE_SMALL_HEADROOM), and a new
-command waits while the kernel reports critical memory pressure or too little
-free memory. Waiters form a FIFO queue built on flock(2): each waiter's file
-stays locked while it waits, and the kernel drops every lock of a process that
-dies, so there is no daemon, lease or registry to repair. Waiting polls (the
-head four times a second, the others twice); only the brief registration and
-admission locks block. The gate is macOS-only. A later request may start
-before earlier ones that wait for tokens alone, when its claim fits now, until
-one of them has waited AGENT_GATE_BACKFILL_SECONDS; after that nothing
-passes it except a 1-token run into the headroom while runs outside the
-headroom hold all T tokens. An aged claim above 1 token cannot start then
-anyway, and an aged 1-token request that fits goes first. Every admission is
-decided and published under one host lock. While an older gate (one without
-that lock) still runs during a rollout, its queue head admits without the lock;
-that stays safe because nothing passes an older gate's waiter.
+Many agents share one Mac. Each gated command reserves k CPU tokens, of which
+it holds at most half of T (AGENT_GATE_MAX_CLAIM), and waits until the rule in
+gate_policy admits it: in short, the runs together hold at most T tokens
+(T = logical CPUs), and memory must have room. A run alone on the machine gets
+every CPU for its runners whatever it reserved. Waiters form a FIFO queue built
+on flock(2): each waiter's file stays locked while it waits, and the kernel
+drops every lock of a process that dies, so there is no daemon, lease or
+registry to repair. Waiting polls (the head four times a second, the others
+twice); only the brief registration and admission locks block. Every admission
+is decided and published under one host lock. The gate is macOS-only.
 
 A command whose work runs in Docker containers also declares the memory it needs
 in the Docker VM (--docker-gib). It first waits in a queue of its own until the
@@ -79,6 +71,7 @@ from gate_macos import (
     lock_holders, memory_signal, own_start, same_process, stop_processes,
     sweep_run, tagged_pids, yield_to_the_owner,
 )
+from gate_policy import Decision, Snapshot, decide, is_aged, number, queue_decision, run_workers
 
 NOT_ADMITTED_EXIT = 75
 CONFIG_EXIT = 78
@@ -105,20 +98,16 @@ PROBE_IMAGES_ENV = "AGENT_GATE_DOCKER_PROBE_IMAGES"
 #: How long a Docker claim must exceed what the VM could offer before it is refused.
 CEILING_ENV = "AGENT_GATE_DOCKER_CEILING_SECONDS"
 
-#: Shimmed runs without -c used p90 1.7 and p95 2.7 CPUs over 72 h (2026-10-19), and
-#: their runners start this many workers, each with its own memory.
+#: The tokens a run without -c reserves: small, so other runs fit beside it. Its runners'
+#: fan-out is decided apart (gate_policy.fan_out) and is the whole machine when it runs alone.
 DEFAULT_CPUS = 2
 DEFAULT_TIMEOUT = 3600.0
-#: The free share read 20-24% on a calm host and 11-12% while it swapped (2026-10-21).
+#: On a 16 GiB Mac the free share read 20-24% while calm and 11-12% while it swapped.
 DEFAULT_MIN_FREE_PCT = 15.0
 DEFAULT_RAMP_SECONDS = 5.0
 DEFAULT_RAMP_MARGIN_PCT = 10.0
 DEFAULT_BACKFILL_SECONDS = 60.0
 DEFAULT_MAX_SWAPOUT_MBPS = 10.0
-#: A waiter record of this protocol or later admits only under the admit lock, so
-#: later requests may pass it. An older gate's record has none: it admits at the
-#: head without that lock, so nothing may pass it while it waits.
-PROTOCOL = 2
 #: Memory a build, a pull or a stopping container takes shows in no running container,
 #: so only a claim the VM falls short of at every survey this long is a configuration error.
 DEFAULT_CEILING_SECONDS = 300.0
@@ -150,11 +139,8 @@ PROBE_IMAGES = ("alpine:latest", "busybox:latest", "redis:7-alpine", "redis:7", 
 COMPOSE_PROJECT_LABEL = "com.docker.compose.project"
 GIB = 2**30
 LOG_LIMIT_BYTES = 20 * 2**20
-#: By absolute path: callers' PATH often leaves out /usr/sbin.
-CRITICAL = 4  # kern.memorystatus_vm_pressure_level: 1 normal, 2 warn, 4 critical
-PRESSURE_NAMES = {1: "normal", 2: "warn", 4: "critical"}
 
-#: Worker limits the runners read, so a run's fan-out equals its tokens.
+#: Worker limits the runners read, set to the run's granted workers.
 #: Vitest 4 reads VITEST_MAX_WORKERS; Vitest 3 reads VITEST_MAX_THREADS/FORKS;
 #: pytest-xdist reads PYTEST_XDIST_AUTO_NUM_WORKERS for `-n auto`.
 RUNNER_ENV = ("VITEST_MAX_WORKERS", "VITEST_MAX_THREADS", "VITEST_MAX_FORKS", "PYTEST_XDIST_AUTO_NUM_WORKERS")
@@ -162,7 +148,7 @@ RUNNER_ENV = ("VITEST_MAX_WORKERS", "VITEST_MAX_THREADS", "VITEST_MAX_FORKS", "P
 WAITER_RE = re.compile(r"^(\d{12})-([0-9a-f]{16})\.lock$")
 JOB_RE = re.compile(r"^([0-9a-f]{16})\.lock$")
 STAGING_RE = re.compile(r"^\..+\.tmp$")
-#: When to try again to stop a dead gate's run; a name older gates' scans pass over.
+#: When to try again to stop a dead gate's run.
 RETRY_RE = re.compile(r"^([0-9a-f]{16})\.retry$")
 
 
@@ -221,14 +207,6 @@ def read_json_fd(fd: int) -> Dict[str, object]:
     return value if isinstance(value, dict) else {}
 
 
-def number(value: object, default: float = 0.0) -> float:
-    try:
-        result = float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return default
-    return result if math.isfinite(result) else default
-
-
 def finite(text: object, name: str) -> float:
     """A finite, non-negative number from the command line or the environment."""
     try:
@@ -264,6 +242,8 @@ class Settings:
         self.jobs = self.root / "jobs"
         self.admit_lock = self.root / "admit.lock"
         self.last_admit = self.root / "last-admit"
+        #: Recent swap-out readings every gate on the host adds to.
+        self.swap_samples = self.root / "swap.json"
         self.events = self.root / "events.jsonl"
         # The Docker VM's memory has a queue and reservations of its own.
         self.docker = self.root / "docker"
@@ -287,14 +267,6 @@ class Settings:
         if value < minimum:
             raise ConfigError(f"{name} must be at least {minimum}")
         return value
-
-    def limit(self, k: float) -> int:
-        """The most tokens all runs may hold once a run claiming `k` starts."""
-        return self.tokens + (self.headroom if k == 1 else 0)
-
-    def ramps(self, free: Optional[int]) -> bool:
-        """Whether admissions are spaced by the ramp: free memory is unreadable or near its minimum."""
-        return free is None or free < self.min_free + self.ramp_margin
 
     def _float(self, name: str, default: float) -> float:
         text = self.environ.get(name)
@@ -465,7 +437,7 @@ def scan_jobs(settings: Settings, sweep: bool = False) -> List[Dict[str, object]
             continue
         live.append(record)
     if sweep:
-        # Retry state whose run is gone, as when an older gate removed it.
+        # Retry state whose run is gone.
         for match, retry in _lock_files(settings.jobs, RETRY_RE, False):
             if not (settings.jobs / f"{match.group(1)}.lock").exists():
                 with contextlib.suppress(OSError):
@@ -567,7 +539,7 @@ def _rotate(path: Path, fd: int) -> None:
 
     It moves under the log's own lock, and only while `path` still names the
     full log, so gates that find it full at once move it once and never move a
-    fresh log over the full one. An older gate moves it without the lock.
+    fresh log over the full one.
     """
     if not try_lock(fd, fcntl.LOCK_EX):
         return
@@ -583,108 +555,21 @@ def _rotate(path: Path, fd: int) -> None:
 # ------------------------------------------------------------------ decisions
 
 
-class Snapshot:
-    def __init__(self, settings: Settings, sweep: bool):
-        self.jobs = scan_jobs(settings, sweep=sweep)
-        self.pressure, self.free, self.swapout = memory_signal(settings.environ)
-        try:
-            self.since_admit = time.time() - settings.last_admit.stat().st_mtime
-        except OSError:
-            self.since_admit = float("inf")
-
-    @property
-    def used(self) -> float:
-        """Tokens held by live runs."""
-        return sum(number(job.get("k")) for job in self.jobs)
-
-    @property
-    def in_headroom(self) -> float:
-        """Tokens of `used` held by runs admitted into the headroom."""
-        return sum(number(job.get("k")) for job in self.jobs if job.get("headroom") is True)
-
-    @property
-    def outside_headroom(self) -> float:
-        """Tokens of `used` held by runs not admitted into the headroom; an older gate's runs count here."""
-        return self.used - self.in_headroom
-
-    def memory_text(self) -> str:
-        if self.free is None:
-            return "memory signal unavailable"
-        level = "pressure unreadable" if self.pressure is None else PRESSURE_NAMES.get(self.pressure, self.pressure)
-        swap = "" if self.swapout is None else f", swapping out {self.swapout:.1f} MiB/s"
-        return f"memory {level}, {self.free}% free{swap}"
-
-
-def is_aged(waiter: Mapping[str, object], settings: Settings, now: float) -> bool:
-    """Whether a queued request has waited AGENT_GATE_BACKFILL_SECONDS."""
-    return now - number(waiter.get("queued"), now) >= settings.backfill
-
-
-def passing_refusal(ahead: Sequence[Mapping[str, object]], k: int, settings: Settings, now: float,
-                    snapshot: Optional[Snapshot] = None) -> Optional[str]:
-    """Why a request claiming `k` may not pass the requests queued ahead of it.
-
-    An older gate's request admits at the head without the admit lock, so
-    nothing passes it. Nothing passes a request that has waited
-    AGENT_GATE_BACKFILL_SECONDS except a 1-token run into the headroom while
-    runs outside the headroom hold all T tokens by themselves. An aged claim
-    above 1 token needs room within T, so it cannot start then anyway, and
-    once one of those runs ends the passing stops, so it waits only for runs
-    that already exist. An aged 1-token request fits whenever the passer does,
-    so the rule that a request ahead that fits goes first protects it.
-    `snapshot` is None before the runs are read, when only the records judge.
-    """
-    aged = False
-    for waiter in ahead:
-        if number(waiter.get("protocol")) < PROTOCOL or number(waiter.get("k")) < 1:
-            return "an earlier request admits only at the head of the queue (an older gate's)"
-        aged = aged or is_aged(waiter, settings, now)
-    if aged and (k != 1 or (snapshot is not None and not (
-            snapshot.outside_headroom >= settings.tokens and snapshot.used + 1 <= settings.limit(1)))):
-        return (f"an earlier request has waited over {settings.backfill:g}s for its tokens; nothing passes it "
-                f"except a 1-token run into the headroom while runs outside it hold all {settings.tokens} tokens")
-    return None
-
-
-def refusal(snapshot: Snapshot, k: int, settings: Settings, ahead: Sequence[Mapping[str, object]] = (),
-            now: Optional[float] = None) -> Optional[str]:
-    """Why a request cannot start now; None when it can.
-
-    `ahead` lists the live requests queued before it. With none, it is the
-    head and starts once the host has room. A later request starts first only
-    while each one ahead waits for tokens alone: memory and the ramp hold every
-    request alike, so one they hold is never passed, and one that fits goes first.
-    """
-    if snapshot.pressure is not None and snapshot.pressure >= CRITICAL:
-        return "memory pressure is critical"
-    if ahead:
-        reason = passing_refusal(ahead, k, settings, time.time() if now is None else now, snapshot)
-        if reason is not None:
-            return reason
-        if any(snapshot.used + number(waiter.get("k")) <= settings.limit(number(waiter.get("k"))) for waiter in ahead):
-            return "an earlier request that fits goes first"
-    if snapshot.used <= 0:
-        return None
-    if snapshot.free is None:
-        return "memory signal unavailable, so one run at a time"
-    if snapshot.used + k > settings.limit(k):
-        extra = f" (+{settings.headroom} for 1-token runs)" if k == 1 and settings.headroom else ""
-        return f"{snapshot.used:g} of {settings.tokens} tokens in use{extra}, {k} needed"
-    if snapshot.free < settings.min_free:
-        return f"{snapshot.free}% memory free, below {settings.min_free:g}%"
-    if snapshot.swapout is None:
-        return "measuring whether the host swaps"
-    if snapshot.swapout > settings.max_swapout:
-        return f"the host swaps out {snapshot.swapout:.1f} MiB/s, over {settings.max_swapout:g}"
-    if settings.ramps(snapshot.free) and snapshot.since_admit < settings.ramp:
-        return "the previous run is still starting"
-    return None
+def read_snapshot(settings: Settings, sweep: bool) -> Snapshot:
+    """The live runs and the memory signal now; with `sweep` (a queue head), dead gates' runs are collected first."""
+    jobs = scan_jobs(settings, sweep=sweep)
+    pressure, free, swapout = memory_signal(settings.environ, settings.swap_samples)
+    try:
+        since_admit = time.time() - settings.last_admit.stat().st_mtime
+    except OSError:
+        since_admit = float("inf")
+    return Snapshot(jobs, pressure, free, swapout, since_admit)
 
 
 def enclosing_run(settings: Settings, environ: Mapping[str, str]) -> Optional[Dict[str, object]]:
     """The live run this process belongs to, proven by ancestry; inherited variables alone prove nothing.
 
-    The result carries the run's budget `k` and its `id`, the run tag its commands keep.
+    The result carries the run's `budget`, the CPUs its commands may use, and its `id`, the run tag they keep.
     """
     chain = ancestors()
     # `gate_alive` is `same_process` on the record, so an ancestor's pid alone completes the identity.
@@ -694,8 +579,9 @@ def enclosing_run(settings: Settings, environ: Mapping[str, str]) -> Optional[Di
     )
     # A nested gate in between exported a smaller budget; a budget only ever shrinks.
     inherited = math.floor(number(environ.get(CPUS_ENV)))
-    if parent is not None and inherited >= 1:
-        parent["k"] = min(int(number(parent.get("k"))), inherited)
+    if parent is not None:
+        budget = int(run_workers(parent))
+        parent["budget"] = min(budget, inherited) if inherited >= 1 else budget
     return parent
 
 
@@ -955,9 +841,11 @@ def block_shared(path: str, deadline: Optional[float], idle: Callable[[], object
 
 class Request:
     def __init__(self, k: int, label: str, argv: Sequence[str], wait: Optional[float], timeout: float,
-                 asked: Optional[int] = None, docker_gib: float = 0.0, docker_frees: str = ""):
+                 asked: Optional[int] = None, docker_gib: float = 0.0, docker_frees: str = "", grow: bool = False):
         self.k = k
         self.asked = k if asked is None else asked
+        #: A default claim (no -c): its runners get the CPUs no other run uses.
+        self.grow = grow
         self.label = label
         self.argv = list(argv)
         self.timeout = timeout
@@ -1053,31 +941,36 @@ def wait_for_turn(settings: Settings, waiters: Path, ticket: int, deadline: Opti
                      lambda: check_off(settings))
 
 
-def decide(settings: Settings, k: int, ticket: int, sweep: bool) -> Tuple[Optional[str], int, Optional[Snapshot]]:
-    """Why the request holding `ticket` cannot start now (None when it can), how many wait ahead, and the snapshot.
+def admission(settings: Settings, request: Request, ticket: int,
+              sweep: bool) -> Tuple[Decision, int, Optional[Snapshot]]:
+    """Whether the request holding `ticket` may start now, how many wait ahead, and the snapshot it was decided on.
 
     The queue is read before the runs: a request leaves the queue only after
     publishing its run, so none is missed between the two readings. With
     `sweep`, a head collects dead gates' runs first.
     """
     ahead = live_waiters(settings, before=ticket)
-    reason = passing_refusal(ahead, k, settings, time.time())
-    if reason is not None:
-        return reason, len(ahead), None
-    snapshot = Snapshot(settings, sweep=sweep and not ahead)
-    return refusal(snapshot, k, settings, ahead), len(ahead), snapshot
+    held = queue_decision(ahead, request.k, settings, time.time())
+    if held is not None:
+        return held, len(ahead), None
+    snapshot = read_snapshot(settings, sweep=sweep and not ahead)
+    decision = decide(snapshot, request.k, settings, ahead, time.time(), request.grow)
+    if not decision.starts and decision.reason:
+        decision = Decision(decision.code, f"{decision.reason} ({snapshot.memory_text()})")
+    return decision, len(ahead), snapshot
 
 
 def admit(settings: Settings, request: Request, progress: Progress) -> Tuple[int, Dict[str, object], float]:
-    """Queue, then start once the host has room and no earlier request must go first.
+    """Queue, then start once gate_policy admits the request.
 
     Several requests may start while one waits for tokens, so each decides and
-    publishes its run under the admit lock. Returns the held job lock, the job
-    record and the time waited. Raises SwitchedOff, out of the queue, once
-    admission control is switched off.
+    publishes its run under the admit lock. Returns the held job lock, the
+    published job record, which holds the run's claim `k` and its `workers`,
+    and the time waited. Raises SwitchedOff, out of the queue, once admission
+    control is switched off.
     """
     deadline = request.deadline
-    record = dict(job_record(request), protocol=PROTOCOL)
+    record = job_record(request)
     with queued(settings, settings.root, request, record, progress) as ticket:
         at_head: Optional[float] = None
         # The log keeps why the run was held back.
@@ -1085,32 +978,33 @@ def admit(settings: Settings, request: Request, progress: Progress) -> Tuple[int
         next_sweep = time.monotonic() + SWEEP_SECONDS
         while True:
             check_off(settings)
-            reason, ahead, snapshot = decide(settings, request.k, ticket, sweep=True)
+            decision, ahead, _ = admission(settings, request, ticket, sweep=True)
             if not ahead and at_head is None:
                 at_head = time.monotonic()
-            if reason is None:
+            if decision.starts:
                 # Decided again under the lock, without the sweep that may take seconds.
                 with exclusive(settings.admit_lock, with_grace(deadline), "admit"):
-                    reason, ahead, snapshot = decide(settings, request.k, ticket, sweep=False)
-                    if reason is None and snapshot is not None:
+                    decision, ahead, snapshot = admission(settings, request, ticket, sweep=False)
+                    if decision.starts and snapshot is not None:
                         admitted = dict(
                             record,
                             admitted=round(time.time(), 3),
+                            workers=decision.workers,
                             pressure=snapshot.pressure,
                             free=snapshot.free,
                             swapout=None if snapshot.swapout is None else round(snapshot.swapout, 1),
                             running=snapshot.used,
                             head_s=0.0 if at_head is None else round(time.monotonic() - at_head, 3),
-                            backfilled=ahead > 0,
-                            headroom=snapshot.used + request.k > settings.tokens,
-                            ramp=snapshot.used > 0 and settings.ramp > 0 and settings.ramps(snapshot.free),
+                            backfilled=decision.backfilled,
+                            headroom=decision.headroom,
+                            ramp=decision.ramp,
                         )
                         if held_back:
                             admitted["held_back"] = held_back
                         job = publish_locked(settings.jobs, f"{request.id}.lock", admitted)
                         settings.last_admit.touch()
                         return job, admitted, time.monotonic() - request.started
-            progress.reason = held_back = reason if snapshot is None else f"{reason} ({snapshot.memory_text()})"
+            progress.reason = held_back = decision.reason or decision.code
             if deadline is not None and time.monotonic() >= deadline:
                 raise WaitExpired(progress.reason)
             progress.announce()
@@ -1242,12 +1136,12 @@ def execute(command: Sequence[str], env: Mapping[str, str]) -> int:
         return cannot_start(command[0], error)
 
 
-def runner_environment(environ: Mapping[str, str], k: int, run_id: str) -> Dict[str, str]:
-    """The command's environment: its worker limits and the run tag."""
+def runner_environment(environ: Mapping[str, str], workers: int, run_id: str) -> Dict[str, str]:
+    """The command's environment: its runners' worker limits and the run tag."""
     env = dict(environ)
-    env[CPUS_ENV] = str(k)
+    env[CPUS_ENV] = str(workers)
     for name in RUNNER_ENV:
-        env[name] = str(k)
+        env[name] = str(workers)
     env[RUN_ENV] = run_id
     return env
 
@@ -1328,98 +1222,85 @@ class Stops:
 def run_admitted(
     settings: Settings, request: Request, job_fd: int, record: Dict[str, object], waited: float
 ) -> int:
+    """Run the admitted command under the gate's guard, then release its reservations and log the run."""
     with Stops() as stops:
-        return _run_admitted(settings, request, job_fd, record, waited, stops)
+        run_id = request.id
+        log_event(settings, dict(record, event="admitted", waited_s=round(waited, 3)))
+        fingerprint: Dict[str, Optional[str]] = {}
+        fingerprinter = threading.Thread(
+            target=lambda: fingerprint.update(tree=tree_fingerprint(os.getcwd())), daemon=True
+        )
+        fingerprinter.start()
+        workers = int(run_workers(record))
+        env = runner_environment(settings.environ, workers, run_id)
+        began = time.monotonic()
+        host_before = host_cpu_ticks()
 
+        def released(**outcome: object) -> None:
+            log_event(settings, {
+                "event": "released", "id": run_id, "label": request.label, "cwd": record.get("cwd"),
+                "k": request.k, "asked": request.asked, "workers": workers, "docker_gib": request.docker_gib,
+                "waited_s": round(waited, 3), "docker_waited_s": round(request.docker_waited, 3),
+                "held_s": round(time.monotonic() - began, 3), **outcome,
+            })
 
-def _run_admitted(
-    settings: Settings, request: Request, job_fd: int, record: Dict[str, object], waited: float, stops: Stops
-) -> int:
-    run_id = request.id
-    log_event(settings, dict(record, event="admitted", waited_s=round(waited, 3)))
-    fingerprint: Dict[str, Optional[str]] = {}
-    fingerprinter = threading.Thread(
-        target=lambda: fingerprint.update(tree=tree_fingerprint(os.getcwd())), daemon=True
-    )
-    fingerprinter.start()
-    env = runner_environment(settings.environ, request.k, run_id)
-    began = time.monotonic()
-    host_before = host_cpu_ticks()
-    stopped = stops.before_start()
-    if stopped is not None:
-        # Stopped before it started: nothing runs, as when stopped while queued.
-        _release(settings, run_id, job_fd)
+        stopped = stops.before_start()
+        if stopped is not None:
+            # Stopped before it started: nothing runs, as when stopped while queued.
+            _release(settings, run_id, job_fd)
+            release_docker(settings, request)
+            released(exit=128 + stopped, signal=None, timed_out=False, cancelled=True, cpu_s=None, cpus=None,
+                     swept=0, survivors=0, left_held=False)
+            return 128 + stopped
+        try:
+            # The command inherits every reservation, so they outlive a killed gate.
+            held_fds = (job_fd,) + (() if request.docker_fd is None else (request.docker_fd,))
+            child = subprocess.Popen(request.argv, env=env, pass_fds=held_fds)
+            yield_to_the_owner(child.pid)
+        except OSError as error:
+            code = cannot_start(request.argv[0], error)
+            _release(settings, run_id, job_fd)
+            release_docker(settings, request)
+            return code
+        stops.started(child)
+
+        used, watched = supervise(settings, request, child, record, began, stops)
+        held = time.monotonic() - began
+        busy = host_busy(host_before, host_cpu_ticks())
+        swept, survivors = sweep_run(run_id)
+        # Survivors keep the run's tokens: its record stays for the queue head to collect.
+        left_held = _release(settings, run_id, job_fd, keep=survivors != {})
         release_docker(settings, request)
-        log_event(settings, {
-            "event": "released", "id": run_id, "label": request.label, "cwd": record.get("cwd"),
-            "k": request.k, "asked": request.asked, "docker_gib": request.docker_gib,
-            "waited_s": round(waited, 3), "docker_waited_s": round(request.docker_waited, 3),
-            "held_s": round(time.monotonic() - began, 3), "exit": 128 + stopped, "signal": None,
-            "timed_out": False, "cancelled": True, "cpu_s": None, "cpus": None, "swept": 0, "survivors": 0,
-            "left_held": False,
-        })
-        return 128 + stopped
-    try:
-        # The command inherits every reservation, so they outlive a killed gate.
-        held_fds = (job_fd,) + (() if request.docker_fd is None else (request.docker_fd,))
-        child = subprocess.Popen(request.argv, env=env, pass_fds=held_fds)
-        yield_to_the_owner(child.pid)
-    except OSError as error:
-        code = cannot_start(request.argv[0], error)
-        _release(settings, run_id, job_fd)
-        release_docker(settings, request)
-        return code
-    stops.started(child)
-
-    used, watched = supervise(settings, request, child, record, began, stops)
-    held = time.monotonic() - began
-    busy = host_busy(host_before, host_cpu_ticks())
-    swept, survivors = sweep_run(run_id)
-    # Survivors keep the run's tokens: its record stays for the queue head to collect.
-    left_held = _release(settings, run_id, job_fd, keep=survivors != {})
-    release_docker(settings, request)
-    fingerprinter.join(0.1)
-    code = child.returncode
-    exit_code = TIMEOUT_EXIT if watched["timed_out"] else (128 - code if code < 0 else code)
-    log_event(
-        settings,
-        {
-            "event": "released",
-            "id": run_id,
-            "label": request.label,
-            "cwd": record.get("cwd"),
-            "k": request.k,
-            "asked": request.asked,
-            "docker_gib": request.docker_gib,
-            "waited_s": round(waited, 3),
-            "docker_waited_s": round(request.docker_waited, 3),
-            "held_s": round(held, 3),
-            "exit": exit_code,
-            "signal": -code if code < 0 else None,
-            "timed_out": watched["timed_out"],
-            "cancelled": watched["cancelled"],
-            "pressure": record.get("pressure"),
-            "free": record.get("free"),
-            "running": record.get("running"),
-            "min_free": watched["min_free"],
-            "max_pressure": watched["max_pressure"],
-            "max_swapout": watched["max_swapout"],
-            "children_maxrss_mib": round(
+        fingerprinter.join(0.1)
+        code = child.returncode
+        exit_code = TIMEOUT_EXIT if watched["timed_out"] else (128 - code if code < 0 else code)
+        released(
+            held_s=round(held, 3),
+            exit=exit_code,
+            signal=-code if code < 0 else None,
+            timed_out=watched["timed_out"],
+            cancelled=watched["cancelled"],
+            pressure=record.get("pressure"),
+            free=record.get("free"),
+            running=record.get("running"),
+            min_free=watched["min_free"],
+            max_pressure=watched["max_pressure"],
+            max_swapout=watched["max_swapout"],
+            children_maxrss_mib=round(
                 used.get("maxrss", resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss) / 2**20, 1
             ),
-            "cpu_s": round(used["cpu_s"], 2) if "cpu_s" in used else None,
-            "cpus": round(used["cpu_s"] / held, 2) if "cpu_s" in used and held > 0 else None,
-            "host_busy": None if busy is None else round(busy, 3),
+            cpu_s=round(used["cpu_s"], 2) if "cpu_s" in used else None,
+            cpus=round(used["cpu_s"] / held, 2) if "cpu_s" in used and held > 0 else None,
+            host_busy=None if busy is None else round(busy, 3),
             # What everything else on the host used meanwhile: agents, servers, the Docker VM, other runs.
-            "others_cpus": None if busy is None or "cpu_s" not in used or held <= 0
+            others_cpus=None if busy is None or "cpu_s" not in used or held <= 0
             else round(max(0.0, busy * (os.cpu_count() or 1) - used["cpu_s"] / held), 2),
-            "swept": swept,
-            "survivors": None if survivors is None else len(survivors),
-            "left_held": left_held,
-            "tree": fingerprint.get("tree"),
-        },
-    )
-    return exit_code
+            swept=swept,
+            survivors=None if survivors is None else len(survivors),
+            left_held=left_held,
+            tree=fingerprint.get("tree"),
+        )
+        return exit_code
 
 
 def supervise(settings: Settings, request: Request, child: "subprocess.Popen[bytes]", record: Mapping[str, object],
@@ -1453,7 +1334,7 @@ def supervise(settings: Settings, request: Request, child: "subprocess.Popen[byt
             escalate["term"] = stops.first + CANCEL_SECONDS
         if now >= next_sample:
             next_sample = now + SAMPLE_SECONDS
-            pressure, free, swapout = memory_signal(settings.environ)
+            pressure, free, swapout = memory_signal(settings.environ, settings.swap_samples)
             if free is not None and (min_free is None or free < number(min_free)):
                 min_free = free
             if pressure is not None and (max_pressure is None or pressure > number(max_pressure)):
@@ -1520,7 +1401,8 @@ def capped_claim(settings: Settings, asked: int) -> int:
 def run(argv: Sequence[str], environ: Optional[Mapping[str, str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="agent-gate", description="Run a heavy command when the machine has room.")
     parser.add_argument("-c", "--cpus", default=None,
-                        help=f"tokens to hold (default {DEFAULT_CPUS}; at most {MAX_CLAIM_ENV}, half the tokens)")
+                        help=f"tokens to reserve, and the runners' worker limit (default: reserve {DEFAULT_CPUS} "
+                             f"and use the CPUs no other run uses; at most {MAX_CLAIM_ENV}, half the tokens)")
     parser.add_argument("-l", "--label", default="")
     parser.add_argument("--docker-gib", default="0", metavar="G",
                         help="memory the command's containers need in the Docker VM, in GiB")
@@ -1559,7 +1441,7 @@ def run(argv: Sequence[str], environ: Optional[Mapping[str, str]] = None) -> int
         say(f"{label} asks for {asked} tokens and runs with {k}, the most one run holds on this machine")
     if parent is not None:
         # Nested: the parent already holds the budget; waiting here could deadlock.
-        budget = min(k, int(number(parent.get("k"), k)))
+        budget = int(number(parent.get("budget"))) if args.cpus is None else min(k, int(number(parent.get("budget"))))
         reserved = number(parent.get("docker_gib"))
         if docker_gib > reserved:
             say(f"{label} needs {docker_gib:g} GiB in the Docker VM inside a run that reserved {reserved:g}; "
@@ -1568,7 +1450,7 @@ def run(argv: Sequence[str], environ: Optional[Mapping[str, str]] = None) -> int
                              "asked": asked, "docker_gib": docker_gib, "cwd": os.getcwd()})
         return execute(command, runner_environment(environ, budget, str(parent["id"])))
 
-    request = Request(k, label, command, wait, timeout, asked, docker_gib, args.docker_frees)
+    request = Request(k, label, command, wait, timeout, asked, docker_gib, args.docker_frees, grow=args.cpus is None)
 
     def not_admitted(reason: str, code: int) -> int:
         log_event(settings, {"event": "not-admitted", "id": request.id, "label": label, "reason": reason,
@@ -1635,8 +1517,8 @@ def inside(argv: Sequence[str] = (), environ: Optional[Mapping[str, str]] = None
         if settings.off.exists():
             return 0
         parent = enclosing_run(settings, environ)
-        if parent is not None and need > number(parent.get("k")):
-            raise ConfigError(f"-c {args.cpus} (as {need} tokens) exceeds the enclosing run's {parent.get('k')} tokens")
+        if parent is not None and need > number(parent.get("budget")):
+            raise ConfigError(f"-c {args.cpus} (as {need} tokens) exceeds the enclosing run's {parent.get('budget')} CPUs")
     except (ConfigError, OSError) as error:
         return unusable(error)
     return 0 if parent is not None else 1
@@ -1652,7 +1534,7 @@ def status(argv: Sequence[str], environ: Optional[Mapping[str, str]] = None) -> 
     try:
         settings = load_settings(environ)
         # A missing directory reads as empty; one that cannot be read is unusable.
-        snapshot = Snapshot(settings, sweep=False)
+        snapshot = read_snapshot(settings, sweep=False)
         waiters = live_waiters(settings, collect=False)
         docker_reserved = docker_holders(settings)
         docker_waiting = live_waiters(settings, collect=False, directory=settings.docker_waiters)
@@ -1675,6 +1557,7 @@ def status(argv: Sequence[str], environ: Optional[Mapping[str, str]] = None) -> 
             "tokens": settings.tokens,
             "headroom": settings.headroom,
             "used": snapshot.used,
+            "workers": snapshot.workers,
             "outside_headroom": snapshot.outside_headroom,
             "headroom_used": snapshot.in_headroom,
             "reserved": reserved,
@@ -1695,7 +1578,7 @@ def status(argv: Sequence[str], environ: Optional[Mapping[str, str]] = None) -> 
         headroom = f" (+{settings.headroom} for 1-token runs; runs admitted into it hold {snapshot.in_headroom:g})"
     print(
         f"{snapshot.used:g} of {settings.tokens} tokens in use{headroom}; {snapshot.memory_text()} "
-        f"(new runs need {settings.min_free:g}% free while others run)"
+        f"(new runs above 1 token need {settings.min_free:g}% free while others run)"
     )
     if aged:
         print(f"{reserved:g} tokens reserved for {len(aged)} request(s) queued over {settings.backfill:g}s; "
@@ -1704,7 +1587,8 @@ def status(argv: Sequence[str], environ: Optional[Mapping[str, str]] = None) -> 
     for job in snapshot.jobs:
         age = now - number(job.get("admitted"), now)
         note = "" if job["gate_alive"] else "  [gate gone: orphaned]" if job["held"] else "  [gate gone: leftovers]"
-        print(f"  running k={job.get('k')} {age:6.0f}s  {job.get('label')}  {job.get('cwd')}{note}")
+        print(f"  running k={job.get('k')} x{run_workers(job):g} workers {age:6.0f}s  {job.get('label')}  "
+              f"{job.get('cwd')}{note}")
     for position, waiter in enumerate(waiters, 1):
         age = now - number(waiter.get("queued"), now)
         print(f"  queued #{position} k={waiter.get('k')} {age:6.0f}s  {waiter.get('label')}  {waiter.get('cwd')}")
