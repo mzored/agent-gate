@@ -398,9 +398,12 @@ def swapout_rate(swapped_out: int, samples: Path) -> Optional[float]:
         readings = readings[-1:]  # an average over a quiet stretch says nothing about now
     if now - newest >= SWAP_MIN_SECONDS / 2:
         staging = samples.with_name(f".{samples.name}.{os.getpid()}.tmp")
-        with contextlib.suppress(OSError):
+        try:
             staging.write_text(json.dumps(readings))
             os.replace(staging, samples)
+        except OSError:
+            with contextlib.suppress(OSError):
+                staging.unlink()
     then, before = readings[0]
     return None if now - then < SWAP_MIN_SECONDS else max(0, swapped_out - before) / (now - then) / 2**20
 

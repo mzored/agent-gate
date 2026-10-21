@@ -15,11 +15,10 @@ Who starts:
   is within AGENT_GATE_RAMP_MARGIN_PCT of that minimum, until the previous admission is
   AGENT_GATE_RAMP_SECONDS old. A 1-token run is small, so only that evidence of harm holds it, not
   the prediction.
-- The queue is FIFO, but a later request may start first while its claim fits and every request
-  ahead waits for tokens alone: a request ahead that fits goes first. Once a request ahead has
-  waited AGENT_GATE_BACKFILL_SECONDS, only a 1-token run into the headroom passes it, and only while
-  runs outside the headroom hold all T tokens, so the aged request waits for no run that starts
-  after it.
+- The queue is FIFO, but a later request may start first while no request ahead may start now, so a
+  1-token run passes a larger one that memory holds. Once a request ahead has waited
+  AGENT_GATE_BACKFILL_SECONDS, only a 1-token run into the headroom passes it, and only while runs
+  outside the headroom hold all T tokens, so the aged request waits for no run that starts after it.
 
 Fan-out (`Decision.workers`): a default claim (no `-c`) gets the CPUs no other run's runners
 use, max(k, T - the other runs' workers), while memory has room for more work; otherwise, and for
@@ -153,9 +152,8 @@ def queue_decision(ahead: Sequence[Mapping[str, object]], k: int, limits: Limits
         return _hold("aged", f"an earlier request has waited over {limits.backfill:g}s for its tokens; nothing "
                              f"passes it except a 1-token run into the headroom while runs outside it hold all "
                              f"{limits.tokens} tokens")
-    if snapshot is not None and any(snapshot.used + number(w.get("k")) <= limit(limits, number(w.get("k")))
-                                    for w in ahead):
-        return _hold("fits-first", "an earlier request that fits goes first")
+    if snapshot is not None and any(decide(snapshot, number(w.get("k")), limits).starts for w in ahead):
+        return _hold("fits-first", "an earlier request that may start goes first")
     return None
 
 
@@ -202,8 +200,6 @@ def decide(snapshot: Snapshot, k: int, limits: Limits, ahead: Sequence[Mapping[s
             return held
     ramp = False
     if snapshot.used > 0:
-        if snapshot.free is None:
-            return _hold("unreadable", "memory signal unavailable, so one run at a time")
         if snapshot.used + k > limit(limits, k):
             extra = f" (+{limits.headroom} for 1-token runs)" if k == 1 and limits.headroom else ""
             return _hold("tokens", f"{snapshot.used:g} of {limits.tokens} tokens in use{extra}, {k} needed")

@@ -374,7 +374,7 @@ class PolicyTest(unittest.TestCase):
         for tokens, headroom in (("1", 1), ("4", 1), ("10", 2), ("16", 3)):
             self.assertEqual(agent_gate.Settings({"AGENT_GATE_TOKENS": tokens}).headroom, headroom)
 
-    def test_a_later_request_passes_only_requests_that_wait_for_tokens_alone(self):
+    def test_a_later_request_passes_only_requests_that_cannot_start_now(self):
         head = [self.waiter(5)]
         self.assertEqual(self.decide(8, 1, 80, k=1, ahead=head), "start")
         self.assertTrue(self.decision(8, 1, 80, k=1, ahead=head).backfilled)
@@ -384,9 +384,11 @@ class PolicyTest(unittest.TestCase):
         self.assertEqual(self.decide(0, 1, 80, k=1, ahead=head), "fits-first")
         self.assertEqual(self.decide(11, 1, 80, k=1, ahead=head + [self.waiter(1)]), "fits-first",
                          "a 1-token request ahead that fits its headroom goes first")
-        # Memory and the ramp hold the head and the later request alike.
+        # Memory and the ramp hold the head and a later request above 1 token alike, but not a 1-token run.
         self.assertEqual(self.decide(8, 1, 10, k=2, ahead=head), "free")
         self.assertEqual(self.decide(8, 1, 30, since=1.0, k=2, ahead=head), "ramp")
+        self.assertEqual(self.decide(8, 1, 10, k=1, ahead=[self.waiter(2)]), "start")
+        self.assertEqual(self.decide(8, 1, 30, since=1.0, k=1, ahead=[self.waiter(2)]), "start")
         self.assertEqual(self.decide(8, 4, 80, k=1, ahead=head), "critical")
 
     def test_only_a_one_token_run_into_a_full_pools_headroom_passes_an_aged_request(self):
