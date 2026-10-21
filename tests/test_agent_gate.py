@@ -1378,7 +1378,7 @@ class ProcessTest(GateCase):
         record = {"id": request.id, "k": 2, "pid": os.getpid(), "start": gate_macos.own_start(),
                   "admitted": time.time()}
         job = agent_gate.publish_locked(settings.jobs, f"{request.id}.lock", record)
-        self.assertTrue(agent_gate._release(settings, request.id, job, keep=True))
+        self.assertTrue(agent_gate.release(settings, request, job, keep=True))
         self.assertTrue((settings.jobs / f"{request.id}.lock").exists())
 
     def test_an_untagged_leftover_holding_the_job_lock_is_stopped_by_the_next_head(self):

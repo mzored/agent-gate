@@ -1,10 +1,9 @@
-"""gate-host against a throwaway home, a fake launchctl and an isolated gate state."""
+"""gate-host against a throwaway home and an isolated gate state."""
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
-import plistlib
 import shutil
 import subprocess
 import sys
@@ -26,28 +25,12 @@ class Fixture:
         # zshenv for every zsh; zprofile again because /etc/zprofile's path_helper reorders PATH.
         (self.home / ".zshenv").write_text(PROFILE)
         (self.home / ".zprofile").write_text(PROFILE)
-        self.calls = self.tmp / "launchctl.log"
-        self.loaded = self.tmp / "loaded"
-        self.launchctl = self.tmp / "launchctl"
-        self.launchctl.write_text(
-            "#!/bin/sh\n"
-            f'echo "$*" >> "{self.calls}"\n'
-            'case "$1" in\n'
-            f'  print) [ -e "{self.loaded}" ] ;;\n'
-            f'  bootstrap) touch "{self.loaded}" ;;\n'
-            f'  bootout) rm -f "{self.loaded}" ;;\n'
-            "esac\n"
-        )
-        self.launchctl.chmod(0o755)
         (self.tmp / "memory").write_text("1 80")
         self.env = {key: value for key, value in os.environ.items()
                     if not key.startswith(("AGENT_", "DEVSHIM_", "GATE_HOST_"))}
         self.env.update(
             HOME=str(self.home),
             GATE_HOST_ROOT=str(ROOT),
-            GATE_HOST_LAUNCHCTL=str(self.launchctl),
-            # Exercise both login declarations regardless of the default.
-            GATE_HOST_AT_LOGIN="off",
             AGENT_GATE_DIR=str(self.tmp / "state"),
             AGENT_GATE_MEMORY_FILE=str(self.tmp / "memory"),
         )
@@ -64,13 +47,6 @@ class Fixture:
     @property
     def shims(self) -> Path:
         return self.home / ".local/devshims"
-
-    @property
-    def plist(self) -> Path:
-        return self.home / "Library/LaunchAgents" / f"{gate_host.LABEL}.plist"
-
-    def launchctl_calls(self) -> list:
-        return self.calls.read_text().splitlines() if self.calls.exists() else []
 
     def cleanup(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -95,11 +71,6 @@ class GateHostTest(unittest.TestCase):
         self.assertEqual(os.readlink(self.f.shims / "agent-gate"), str(ROOT / "bin" / "agent-gate"))
         for tool in gate_host.TOOLS:
             self.assertEqual(os.readlink(self.f.shims / tool), "_devshim")
-        with self.f.plist.open("rb") as handle:
-            agent = plistlib.load(handle)
-        self.assertEqual(agent["ProgramArguments"][1:], [str(ROOT / "bin" / "agent-gate"), "off"])
-        self.assertTrue(agent["RunAtLoad"])
-        self.assertIn(f"bootstrap gui/{os.getuid()} {self.f.plist}", self.f.launchctl_calls())
 
         doctor = self.f.run("doctor")
         self.assertEqual(doctor.returncode, 0, doctor.stdout + doctor.stderr)
@@ -110,10 +81,7 @@ class GateHostTest(unittest.TestCase):
         result = self.f.run()
         self.assertEqual(result.returncode, 1)
         self.assertIn("missing ~/.local/devshims/make -> _devshim", result.stdout)
-        self.assertIn(f"missing LaunchAgent {gate_host.LABEL}", result.stdout)
         self.assertFalse((self.f.home / ".local").exists())
-        self.assertFalse(self.f.plist.exists())
-        self.assertFalse(any(call.startswith(("bootstrap", "bootout")) for call in self.f.launchctl_calls()))
 
     def test_uninstall_removes_only_owned_wiring(self):
         self.assertEqual(self.f.run("install").returncode, 0)
@@ -132,8 +100,6 @@ class GateHostTest(unittest.TestCase):
             self.assertFalse((self.f.shims / name).is_symlink(), name)
         self.assertEqual(os.readlink(changed), "/somewhere/else")
         self.assertEqual(foreign.read_text(), "mine\n")
-        self.assertFalse(self.f.plist.exists())
-        self.assertFalse(self.f.loaded.exists())
         self.assertEqual((self.f.home / ".zshenv").read_text(), profile)
         self.assertTrue(state.exists())
         self.assertEqual(self.f.run("uninstall").returncode, 0)
@@ -163,42 +129,6 @@ class GateHostTest(unittest.TestCase):
         self.assertEqual(os.readlink(self.f.shims / "cargo"), "_devshim")
         self.assertTrue((self.f.shims / "ubi").exists(), "a file that is not a shim is not ours")
 
-    def test_install_rewrites_a_changed_agent_and_reloads_it(self):
-        self.assertEqual(self.f.run("install").returncode, 0)
-        with self.f.plist.open("rb") as handle:
-            agent = plistlib.load(handle)
-        agent["ProgramArguments"] = ["/usr/bin/python3", "/elsewhere/agent-gate", "off"]
-        self.f.plist.write_bytes(plistlib.dumps(agent))
-        doctor = self.f.run("doctor")
-        self.assertIn("differs in ProgramArguments", doctor.stdout)
-        self.assertEqual(doctor.returncode, 1)
-
-        result = self.f.run("install")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        calls = self.f.launchctl_calls()
-        self.assertEqual([c.split()[0] for c in calls if c.startswith(("bootout", "bootstrap"))][-2:],
-                         ["bootout", "bootstrap"])
-        self.assertEqual(self.f.run("doctor").returncode, 0)
-
-    def test_declared_on_removes_the_agent_without_switching_admission_on(self):
-        self.assertEqual(self.f.run("install").returncode, 0)
-        self.assertEqual(self.f.gate("off").returncode, 0)
-        result = self.f.run("install", GATE_HOST_AT_LOGIN="on")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertFalse(self.f.plist.exists())
-        self.assertFalse(self.f.loaded.exists())
-        self.assertIn("admission control is off now; declared on at login", result.stdout)
-        self.assertEqual(self.f.run("doctor", GATE_HOST_AT_LOGIN="on").returncode, 0)
-
-    def test_declared_off_switches_admission_off_now_and_install_says_so(self):
-        result = self.f.run("install")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertRegex(result.stdout, r"LaunchAgent \S+ written and loaded; it runs `agent-gate off` now, "
-                                        r"so admission is off host-wide from this moment and at every login")
-        self.assertRegex(" ".join(gate_host.__doc__.split()),
-                         r'With AT_LOGIN = "off", install loads the LaunchAgent with RunAtLoad, '
-                         r"so `agent-gate off` runs right away")
-
     def test_doctor_flags_shims_behind_the_system_path_in_a_login_shell(self):
         self.assertEqual(self.f.run("install").returncode, 0)
         (self.f.home / ".zprofile").write_text("")
@@ -207,9 +137,7 @@ class GateHostTest(unittest.TestCase):
         self.assertIn("ok      PATH in `zsh -c` reaches the shims first", result.stdout)
         self.assertRegex(result.stdout, r"wrong   PATH in `zsh -lc` reaches .*make -> /usr/bin/make")
 
-    def test_a_bad_declaration_is_a_usage_error(self):
-        result = self.f.run("doctor", GATE_HOST_AT_LOGIN="maybe")
-        self.assertEqual(result.returncode, 2)
+    def test_an_unknown_command_is_a_usage_error(self):
         self.assertEqual(self.f.run("frobnicate").returncode, 2)
 
 
@@ -235,15 +163,12 @@ class LiveCheckoutTest(unittest.TestCase):
 
     def assert_host_untouched(self) -> None:
         self.assertFalse((self.f.home / ".local").exists())
-        self.assertFalse(self.f.plist.exists())
-        self.assertFalse(any(call.startswith(("bootstrap", "bootout")) for call in self.f.launchctl_calls()))
 
     def test_install_from_a_linked_worktree_is_refused_and_names_the_live_checkout(self):
         result = self.run_from(self.worktree, "install")
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn(str(self.main), result.stderr)
         self.assertEqual(result.stdout, "")
-        self.assertEqual(self.f.launchctl_calls(), [])
         self.assert_host_untouched()
 
     def test_install_from_a_checkout_that_is_not_the_declared_root_is_refused(self):
@@ -272,8 +197,6 @@ class LiveCheckoutTest(unittest.TestCase):
                 self.assertIn(str(self.main), result.stderr)
                 self.assertEqual(os.readlink(self.f.shims / link), str(target))
                 self.assertEqual([path.name for path in self.f.shims.iterdir()], [link])
-                self.assertFalse(self.f.plist.exists())
-                self.assertEqual(self.f.launchctl_calls(), [])
             (self.f.shims / link).unlink()
 
     def test_doctor_from_a_second_clone_judges_the_host_against_the_live_links(self):

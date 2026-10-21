@@ -39,7 +39,7 @@ DEVSHIM_EXPLAIN=1 npm test
 
 `install` creates links in `~/.local/devshims`. It will not replace regular files. `doctor` reports the links and PATH order without changing them. `DEVSHIM_EXPLAIN=1` shows how a command would be routed without running it. Set `DEVSHIM_BYPASS=1` for one command that should skip the shim.
 
-To stop admission temporarily, run `./bin/agent-gate off`. Run `./bin/agent-gate on` to resume it. The switch applies to every gate on the Mac. To remove the shims and this project's login agent, run `./bin/gate-host uninstall`; remove the PATH lines yourself. Uninstall leaves running commands and gate state alone.
+To stop admission temporarily, run `./bin/agent-gate off`. Run `./bin/agent-gate on` to resume it. The switch applies to every gate on the Mac. To remove the shims, run `./bin/gate-host uninstall`; remove the PATH lines yourself. Uninstall leaves running commands and gate state alone.
 
 ## Develop
 
