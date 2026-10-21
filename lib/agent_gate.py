@@ -222,8 +222,13 @@ def finite(text: object, name: str) -> float:
 
 
 class Settings:
-    def __init__(self, environ: Mapping[str, str]):
-        self.environ = environ
+    """The tuning and state paths of `environ`, a copy of it; the process environment by default.
+
+    ConfigError when a value is bad.
+    """
+
+    def __init__(self, environ: Optional[Mapping[str, str]] = None):
+        self.environ = dict(os.environ if environ is None else environ)
         self.tokens = self._int(TOKENS_ENV, os.cpu_count() or 1)
         # The most one run holds, so that no single claim drains the machine.
         self.max_claim = min(self.tokens, self._int(MAX_CLAIM_ENV, max(1, self.tokens // 2)))
@@ -236,7 +241,7 @@ class Settings:
         # so they may run beside a full pool.
         self.headroom = self._int(HEADROOM_ENV, max(1, self.tokens // 5), minimum=0)
         self.docker_ceiling = self._float(CEILING_ENV, DEFAULT_CEILING_SECONDS)
-        root = environ.get(DIR_ENV) or f"/tmp/agent-gate-{os.getuid()}"
+        root = self.environ.get(DIR_ENV) or f"/tmp/agent-gate-{os.getuid()}"
         self.root = Path(root)
         self.waiters = self.root / "waiters"
         self.jobs = self.root / "jobs"
@@ -252,7 +257,7 @@ class Settings:
         self.docker_vm = self.docker / "vm.json"
         #: Present while admission control is off host-wide (`agent-gate off`).
         self.off = self.root / "off"
-        images = (environ.get(PROBE_IMAGES_ENV) or "").replace(",", " ").split() or PROBE_IMAGES
+        images = (self.environ.get(PROBE_IMAGES_ENV) or "").replace(",", " ").split() or PROBE_IMAGES
         # `docker image ls` names an image by repository and tag.
         self.probe_images = tuple(name if ":" in name.rsplit("/", 1)[-1] else f"{name}:latest" for name in images)
 
@@ -281,11 +286,6 @@ class Settings:
             info = os.lstat(path)
             if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
                 raise ConfigError(f"{path} must be a directory owned by uid {os.getuid()} with mode 0700")
-
-
-def load_settings(environ: Optional[Mapping[str, str]] = None) -> Settings:
-    """The settings of `environ`, a copy of it; the process environment by default. ConfigError when they are bad."""
-    return Settings(dict(os.environ if environ is None else environ))
 
 
 @contextlib.contextmanager
@@ -884,10 +884,11 @@ def job_record(request: Request, tokens: bool = True, queued: Optional[float] = 
     return record
 
 
-def register(settings: Settings, queue: Path, request: Request, record: Mapping[str, object]) -> Tuple[int, int, Path]:
-    """Take the next ticket of the queue in `queue` and publish our waiter file there.
+@contextlib.contextmanager
+def queued(queue: Path, request: Request, record: Mapping[str, object], progress: Progress) -> Iterator[int]:
+    """Take the next ticket of the queue in `queue` and hold a place there while the block runs; yields the ticket.
 
-    Returns the waiter's held lock, its ticket and its path.
+    However the block ends, the request leaves that queue.
     """
     waiters = queue / "waiters"
     # A request that may not wait still gets a moment to register, in each queue it joins.
@@ -901,19 +902,8 @@ def register(settings: Settings, queue: Path, request: Request, record: Mapping[
         staging = queue / ".ticket.tmp"
         staging.write_text(str(ticket))
         os.replace(staging, queue / "ticket")
-        name = f"{ticket:012d}-{request.id}.lock"
-        waiter = publish_locked(waiters, name, dict(record, ticket=ticket))
-    return waiter, ticket, waiters / name
-
-
-@contextlib.contextmanager
-def queued(settings: Settings, queue: Path, request: Request, record: Mapping[str, object],
-           progress: Progress) -> Iterator[int]:
-    """Hold a place in the queue in `queue` while the block runs; yields its ticket.
-
-    However the block ends, the request leaves that queue.
-    """
-    waiter, ticket, waiter_path = register(settings, queue, request, record)
+        waiter_path = waiters / f"{ticket:012d}-{request.id}.lock"
+        waiter = publish_locked(waiters, waiter_path.name, dict(record, ticket=ticket))
     progress.ticket = ticket
     try:
         yield ticket
@@ -971,7 +961,7 @@ def admit(settings: Settings, request: Request, progress: Progress) -> Tuple[int
     """
     deadline = request.deadline
     record = job_record(request)
-    with queued(settings, settings.root, request, record, progress) as ticket:
+    with queued(settings.root, request, record, progress) as ticket:
         at_head: Optional[float] = None
         # The log keeps why the run was held back.
         held_back: Optional[str] = None
@@ -1036,7 +1026,7 @@ def admit_docker(settings: Settings, request: Request, progress: Progress) -> No
     # Since when every survey has found the claim more than the VM could offer, and the most it found.
     short_since: Optional[float] = None
     most = 0.0
-    with queued(settings, settings.docker, request, record, progress) as ticket:
+    with queued(settings.docker, request, record, progress) as ticket:
         wait_for_turn(settings, settings.docker_waiters, ticket, request.deadline, progress)
         while True:
             check_off(settings)
@@ -1247,8 +1237,7 @@ def run_admitted(
         stopped = stops.before_start()
         if stopped is not None:
             # Stopped before it started: nothing runs, as when stopped while queued.
-            _release(settings, run_id, job_fd)
-            release_docker(settings, request)
+            release(settings, request, job_fd)
             released(exit=128 + stopped, signal=None, timed_out=False, cancelled=True, cpu_s=None, cpus=None,
                      swept=0, survivors=0, left_held=False)
             return 128 + stopped
@@ -1259,8 +1248,7 @@ def run_admitted(
             yield_to_the_owner(child.pid)
         except OSError as error:
             code = cannot_start(request.argv[0], error)
-            _release(settings, run_id, job_fd)
-            release_docker(settings, request)
+            release(settings, request, job_fd)
             return code
         stops.started(child)
 
@@ -1269,8 +1257,7 @@ def run_admitted(
         busy = host_busy(host_before, host_cpu_ticks())
         swept, survivors = sweep_run(run_id)
         # Survivors keep the run's tokens: its record stays for the queue head to collect.
-        left_held = _release(settings, run_id, job_fd, keep=survivors != {})
-        release_docker(settings, request)
+        left_held = release(settings, request, job_fd, keep=survivors != {})
         fingerprinter.join(0.1)
         code = child.returncode
         exit_code = TIMEOUT_EXIT if watched["timed_out"] else (128 - code if code < 0 else code)
@@ -1373,16 +1360,17 @@ def reap(child: "subprocess.Popen[bytes]") -> Dict[str, float]:
     return {"cpu_s": rusage.ru_utime + rusage.ru_stime, "maxrss": float(rusage.ru_maxrss)}
 
 
-def _release(settings: Settings, run_id: str, job_fd: int, keep: bool = False) -> bool:
-    """Drop the job lock and its file; True when the run's record stays counted.
+def release(settings: Settings, request: Request, job_fd: int, keep: bool = False) -> bool:
+    """Give back the run's tokens and Docker VM reservation; True when its job record stays counted.
 
     It stays when `keep` is set or an escaped process still holds the job
     lock. The queue head stops whatever remains once this gate is gone.
     """
     os.close(job_fd)
+    release_docker(settings, request)
     if keep:
         return True
-    path = settings.jobs / f"{run_id}.lock"
+    path = settings.jobs / f"{request.id}.lock"
     for _ in range(20):
         if _remove_unlocked(path):
             return False
@@ -1418,7 +1406,7 @@ def run(argv: Sequence[str], environ: Optional[Mapping[str, str]] = None) -> int
     if not command:
         parser.error("a command is required")
     try:
-        settings = load_settings(environ)
+        settings = Settings(environ)
         environ = settings.environ
         asked = DEFAULT_CPUS if args.cpus is None else math.ceil(finite(args.cpus, "-c"))
         if asked < 1:
@@ -1487,7 +1475,7 @@ def run(argv: Sequence[str], environ: Optional[Mapping[str, str]] = None) -> int
 def switch(on: bool, environ: Optional[Mapping[str, str]] = None) -> int:
     """`agent-gate on|off`: resume or stop admission control for every gate on the host."""
     try:
-        settings = load_settings(environ)
+        settings = Settings(environ)
         settings.ensure()
         if on:
             with contextlib.suppress(FileNotFoundError):
@@ -1511,7 +1499,7 @@ def inside(argv: Sequence[str] = (), environ: Optional[Mapping[str, str]] = None
                         help=f"tokens the caller needs from the enclosing run (at most {MAX_CLAIM_ENV}, as for a claim)")
     args = parser.parse_args(argv)
     try:
-        settings = load_settings(environ)
+        settings = Settings(environ)
         environ = settings.environ
         need = 0 if args.cpus is None else capped_claim(settings, math.ceil(finite(args.cpus, "-c")))
         if settings.off.exists():
@@ -1532,7 +1520,7 @@ def status(argv: Sequence[str], environ: Optional[Mapping[str, str]] = None) -> 
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     try:
-        settings = load_settings(environ)
+        settings = Settings(environ)
         # A missing directory reads as empty; one that cannot be read is unusable.
         snapshot = read_snapshot(settings, sweep=False)
         waiters = live_waiters(settings, collect=False)
@@ -1634,10 +1622,6 @@ def percentile(values: Sequence[float], share: float, weights: Optional[Sequence
     return pairs[-1][0]
 
 
-def others_text(cpus: object) -> str:
-    return "-" if cpus is None else f"{number(cpus):.1f}"
-
-
 def measured_runs(settings: Settings, since: float, match: str) -> Dict[Tuple[str, int], List[Dict[str, object]]]:
     """Released runs that recorded their CPUs since `since`, labelled with `match`, by kind of command and claim.
 
@@ -1702,7 +1686,7 @@ def usage(argv: Sequence[str], environ: Optional[Mapping[str, str]] = None) -> i
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     try:
-        settings = load_settings(environ)
+        settings = Settings(environ)
         hours = finite(args.hours, "--hours")
         kinds = measured_runs(settings, time.time() - hours * 3600, args.match)
     except (ConfigError, OSError) as error:
@@ -1719,9 +1703,10 @@ def usage(argv: Sequence[str], environ: Optional[Mapping[str, str]] = None) -> i
     for row in rows:
         fits = row["fits"]
         mark = "  " if fits is None or fits == row["k"] else " <" if fits < row["k"] else " >"
+        others = "-" if row["others_cpus_p50"] is None else f"{number(row['others_cpus_p50']):.1f}"
         print(
             f"{row['runs']:>4} {row['k']:>2} {'vm' if fits is None else fits:>4}{mark}{row['cpus_p50']:>6.2f} {row['cpus_p90']:>5.2f} "
-            f"{row['held_s_p50']:>7.1f}s {row['maxrss_mib_p90']:>6.0f}Mi {others_text(row['others_cpus_p50']):>6}  {row['kind']}"
+            f"{row['held_s_p50']:>7.1f}s {row['maxrss_mib_p90']:>6.0f}Mi {others:>6}  {row['kind']}"
         )
     print(
         "fits: the time-weighted p90 CPUs to the nearest token; < claims more than it uses, > less. "
