@@ -3,12 +3,9 @@
 # gate_host.TOOLS); versioned here, linked from ~/.local/devshims/_devshim.
 # tests/test_entrypoints.py fails when a tool there has no heavy test verb here.
 #
-# Why shims and not shell functions: a function in ~/.zshrc exists only inside
-# an interactive zsh. Agents, git hooks, VS Code tasks and `bash -lc` all run
-# non-interactive shells (or no shell at all), so the function was invisible to
-# exactly the processes that needed gating. PATH is inherited by everything, so
-# an entry point placed on PATH is. This is the same mechanism ccache, sccache,
-# mise, asdf and pyenv use.
+# Why shims and not shell functions: agents, git hooks, editor tasks and
+# `bash -lc` run non-interactive shells or none, where a function in ~/.zshrc does
+# not exist; PATH reaches every process (as for ccache, mise or pyenv).
 #
 # Why entry points (`npm`, `pnpm`, `make`) come first: npm/pnpm put
 # node_modules/.bin at the front of PATH, so inside a script the shim named
@@ -22,8 +19,8 @@
 # (`bunx`, say) also joins the launcher case under "subcommand" below.
 #
 # Only verification that fans out (tests, e2e, builds, verify/ci/release/bench)
-# queues. Linters, formatters and type checkers are short single processes:
-# queueing them cost 7.6 hours of waiting for 2 hours of work (2026-10-08).
+# queues. Linters, formatters and type checkers are short single processes, and
+# queueing them costs more waiting than their work takes.
 #
 # Decisions, in order:
 #   bypass     DEVSHIM_BYPASS=1: run as is.
@@ -33,8 +30,7 @@
 #              adds nothing. Its bundlers still take the gate.
 #   gate       a heavy verb elsewhere: agent-gate queues it for its default claim.
 #   direct     everything else, dev servers and watchers included. No QoS class:
-#              background pinned runs to the efficiency cores and turned 10 s
-#              into 10 min (2026-08-09).
+#              background pins a run to the efficiency cores.
 #
 # Escape hatch: DEVSHIM_BYPASS=1 <tool> ...   runs the real tool untouched.
 # Diagnosis:    DEVSHIM_EXPLAIN=1 <tool> ...  prints the decision, runs nothing.
@@ -73,7 +69,7 @@ fi
 # Make's targets, one per line, and the directory it runs in. Every make rule
 # below reads targets from here and nothing else: option values (-C DIR, -f FILE,
 # -j 4) and VAR=VALUE overrides are not targets, so a path ending in "-tests" or
-# a PR title containing "check" must never classify the run (2026-09-27).
+# a PR title containing "check" never classifies the run.
 make_targets=""
 make_dir="$PWD"
 make_dry=0
@@ -375,11 +371,10 @@ launcher_dir=""
 call_watch=0
 case "$self" in
   npm|pnpm|yarn|bun|npx|uv|poetry)
-    # Options come before the verb, so read past them first. `npm --prefix client
-    # run lint` used to classify as `--prefix`, which is no verb at all, so every
-    # client-side gate landed in the fallback below. The options that name a
-    # directory are recorded on the way. Scanned without shifting: bash 3.2, which
-    # is /bin/sh here, cannot parse a `case` inside a `$( )`.
+    # Options come before the verb, so read past them first (`npm --prefix client
+    # run lint`), recording the options that name a directory on the way. Scanned
+    # without shifting: bash 3.2, which is /bin/sh here, cannot parse a `case`
+    # inside a `$( )`.
     skip_next=0
     skip_dir=0
     skip_call=0
@@ -675,8 +670,7 @@ fi
 # ------------------------------------------------------------------ dispatch
 # A repository's marker covers what its own guards cover: its make targets and
 # its test entry points. A bundler it runs as a package script or directly is
-# guarded by neither, so it falls through to the gate (gosquash#895 and
-# get5stars#883 reviews, 2026-09-30).
+# guarded by neither, so it falls through to the gate.
 if [ "$heavy" -eq 1 ] && [ "$owned" = 1 ]; then
   repo_entry=0
   case "$self" in make|pytest|vitest|playwright) repo_entry=1 ;; esac

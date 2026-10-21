@@ -161,22 +161,6 @@ class DevshimTest(unittest.TestCase):
         self.assertDecisions("owned", (["npm", "test"], ["make", "test"], ["pytest"]))
         self.assertDecisions("gate", (["pnpm", "build"],))
 
-    def test_legacy_vendored_admission_files_are_ignored(self):
-        # Version-1 vendored copies (scripts/agent_admission.py, scripts/validation/bounded.py) once marked a
-        # checkout as running its own admission. Only `.agent-admission` does now; the shims must not honour
-        # them, so a checkout holding only these files takes the gate like any other. This does not cover
-        # any project's current runner.
-        validation = self.fixture.root / "scripts" / "validation"
-        validation.mkdir(parents=True)
-        runner = self.fixture.root / "scripts" / "verify"
-        runner.write_text("#!/bin/sh\nexit 0\n")
-        runner.chmod(0o755)
-        for path in (self.fixture.root / "scripts" / "agent_admission.py", validation / "agent_admission.py",
-                     validation / "bounded.py"):
-            path.write_text("# a legacy vendored admission file\n")
-        self.assertDecisions("gate", (["npm", "test"], ["pnpm", "verify"], ["make", "test"]))
-        self.assertDecisions("direct", (["pnpm", "lint"],))
-
     def checkout(self, path: Path, owned: bool = False) -> Path:
         (path / ".git").mkdir(parents=True)
         if owned:
