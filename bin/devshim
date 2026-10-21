@@ -1,0 +1,708 @@
+#!/bin/sh
+# devshim: one body behind every shim in ~/.local/devshims (the tools listed in
+# gate_host.TOOLS); versioned here, linked from ~/.local/devshims/_devshim.
+# tests/test_entrypoints.py fails when a tool there has no heavy test verb here.
+#
+# Why shims and not shell functions: a function in ~/.zshrc exists only inside
+# an interactive zsh. Agents, git hooks, VS Code tasks and `bash -lc` all run
+# non-interactive shells (or no shell at all), so the function was invisible to
+# exactly the processes that needed gating. PATH is inherited by everything, so
+# an entry point placed on PATH is. This is the same mechanism ccache, sccache,
+# mise, asdf and pyenv use.
+#
+# Why entry points (`npm`, `pnpm`, `make`) come first: npm/pnpm put
+# node_modules/.bin at the front of PATH, so inside a script the shim named
+# `vitest` loses to the local binary. Gating the entry point closes that
+# because the gate's run tag and worker limits are inherited by the whole
+# process subtree. The runner shims (`vitest`, `playwright`, `pytest`) catch
+# only direct calls from a shell.
+#
+# Adding a tool: name it in gate_host.TOOLS and its test verb in
+# tests/test_entrypoints.py TEST_VERB. A launcher whose verb follows options
+# (`bunx`, say) also joins the launcher case under "subcommand" below.
+#
+# Only verification that fans out (tests, e2e, builds, verify/ci/release/bench)
+# queues. Linters, formatters and type checkers are short single processes:
+# queueing them cost 7.6 hours of waiting for 2 hours of work (2026-10-08).
+#
+# Decisions, in order:
+#   bypass     DEVSHIM_BYPASS=1: run as is.
+#   owned      a make target or a test entry point in a repository that declares
+#              `.agent-admission` at its root: its runner calls agent-gate
+#              itself and its test frameworks refuse unbounded runs, so the shim
+#              adds nothing. Its bundlers still take the gate.
+#   gate       a heavy verb elsewhere: agent-gate queues it for its default claim.
+#   direct     everything else, dev servers and watchers included. No QoS class:
+#              background pinned runs to the efficiency cores and turned 10 s
+#              into 10 min (2026-08-09).
+#
+# Escape hatch: DEVSHIM_BYPASS=1 <tool> ...   runs the real tool untouched.
+# Diagnosis:    DEVSHIM_EXPLAIN=1 <tool> ...  prints the decision, runs nothing.
+
+set -e
+
+self=${0##*/}
+shimdir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+resolved_self=$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")
+shared_bin=$(dirname -- "$resolved_self")
+
+# Resolve the real tool with this directory removed from PATH, or we recurse.
+cleanpath=$(printf '%s' "${PATH:-}" | tr ':' '\n' | grep -vxF "$shimdir" | paste -sd: - || true)
+real=$(PATH="$cleanpath" command -v "$self" 2>/dev/null || true)
+
+if [ -z "$real" ] || [ "$real" = "$0" ]; then
+  echo "devshim: $self not found on PATH (outside $shimdir)" >&2
+  exit 127
+fi
+
+explain() {
+  if [ -n "${DEVSHIM_EXPLAIN:-}" ]; then
+    echo "devshim: tool=$self real=$real sub=${sub:-<none>} watching=${watching:-0} heavy=${heavy:-0} root=${root:-<none>} decision=$1"
+    exit 0
+  fi
+}
+
+if [ -n "${DEVSHIM_BYPASS:-}" ]; then
+  explain bypass
+  exec "$real" "$@"
+fi
+
+# Commands inside a gated run are classified too: agent-gate recognises its own
+# live ancestor and runs them in that budget without queueing again.
+
+# Make's targets, one per line, and the directory it runs in. Every make rule
+# below reads targets from here and nothing else: option values (-C DIR, -f FILE,
+# -j 4) and VAR=VALUE overrides are not targets, so a path ending in "-tests" or
+# a PR title containing "check" must never classify the run (2026-09-27).
+make_targets=""
+make_dir="$PWD"
+make_dry=0
+if [ "$self" = "make" ]; then
+  make_skip=""
+  make_operands=0
+  for make_arg in "$@"; do
+    # After "--" every argument is an operand: a target or VAR=VALUE.
+    if [ "$make_operands" = 1 ]; then
+      case "$make_arg" in
+        *=*) ;;
+        *) make_targets="${make_targets}${make_arg}
+" ;;
+      esac
+      continue
+    fi
+    if [ -n "$make_skip" ]; then
+      case "$make_skip" in
+        dir) make_dir="$make_arg" ;;
+        optional-number)
+          case "$make_arg" in
+            ''|*[!0-9.]*) ;;
+            *) make_skip=""; continue ;;
+          esac ;;
+      esac
+      if [ "$make_skip" != "optional-number" ]; then
+        make_skip=""
+        continue
+      fi
+      make_skip=""
+    fi
+    case "$make_arg" in
+      --) make_operands=1 ;;
+      --directory) make_skip=dir ;;
+      --file|--makefile|--include-dir|--old-file|--assume-old|--what-if|--new-file|--assume-new|--eval) make_skip=value ;;
+      --jobs|--load-average|--max-load) make_skip=optional-number ;;
+      # A dry run prints the recipes and a question only asks whether work is due.
+      --dry-run|--just-print|--recon|--question) make_dry=1 ;;
+      --directory=*) make_dir=${make_arg#*=} ;;
+      --*) ;;
+      -?*)
+        # A cluster of short options such as -sC DIR or -ksj4. The first one that
+        # takes a value ends the cluster: the rest of the word is that value, or
+        # the value is the next argument.
+        make_rest=${make_arg#-}
+        while [ -n "$make_rest" ]; do
+          make_opt=${make_rest%"${make_rest#?}"}
+          make_rest=${make_rest#?}
+          case "$make_opt" in
+            C|f|I|o|W|E)
+              if [ -z "$make_rest" ]; then
+                if [ "$make_opt" = C ]; then make_skip=dir; else make_skip=value; fi
+              elif [ "$make_opt" = C ]; then
+                make_dir=$make_rest
+              fi
+              break ;;
+            j|l)
+              if [ -z "$make_rest" ]; then make_skip=optional-number; fi
+              break ;;
+            n|q) make_dry=1 ;;
+            # -O takes an optional value that is always attached.
+            O) break ;;
+          esac
+        done ;;
+      -|*=*) ;;
+      *) make_targets="${make_targets}${make_arg}
+" ;;
+    esac
+  done
+fi
+
+# Sets verb_class for a script or target name: `heavy` (it fans out), `light` (a
+# short single process, a dev server, a watcher or a test UI: never queued) or
+# `none` (the name says nothing), and returns 0 only for heavy. Script and target
+# names are read token by token (split on - and :), so the rule covers current
+# and future namespaces. The first decisive token wins: `test:e2e` and
+# `asset:hero:test-x` fan out; `format:check`, `typecheck:tests` and `check:types`
+# are one short process. A bare `check` may bundle tests.
+#
+# Every rule that makes a name long-lived (so never queued) reads where its token
+# stands and whether another token says the run finishes, because a false direct
+# overloads the host while a false gate only waits:
+#   - dev, start, serve, up, down and logs lead the name and nothing cancels them:
+#     `start:ci` is the server an e2e run talks to;
+#   - `watch` may stand anywhere (`test:watch:e2e`); a ci, headless, once, no or
+#     run token says the run finishes;
+#   - ui, serve or debug end the name right after a token for tests (`test:ui`,
+#     `e2e:debug`, `test:watch:ui`), never `test:ui:ci`, `ui:test` or `cov:ui`;
+#     the same cancelling tokens apply, and a unit token too.
+verification_verb() {
+  verb_class=none
+  verb_rest=$1
+  verb_first=""
+  verb_weak=1
+  verb_watch=0
+  verb_last=""
+  verb_before=""
+  verb_ends=0
+  verb_run=0
+  verb_unit=0
+  verb_and=0
+  verb_and_heavy=0
+  while [ -n "$verb_rest" ]; do
+    verb_token=${verb_rest%%[-:]*}
+    case "$verb_rest" in
+      *[-:]*) verb_rest=${verb_rest#*[-:]} ;;
+      *) verb_rest="" ;;
+    esac
+    case "$verb_token" in
+      test|tests|build|verify|cov|coverage|e2e|ci|release|gate|bench|benchmark|\
+      vitest|jest|pytest|unittest|playwright|__runner__)
+        [ -n "$verb_first" ] || verb_first=heavy
+        [ "$verb_and" = 0 ] || verb_and_heavy=1 ;;
+      lint|format|fmt|typecheck|types|tsc|eslint|prettier|ruff|mypy|pyright|\
+      basedpyright|black|isort|biome|stylelint)
+        [ -n "$verb_first" ] || verb_first=light ;;
+      check|checks) verb_weak=0 ;;
+    esac
+    case "$verb_token" in
+      ci|headless|once|no) verb_ends=1 ;;
+      watch) verb_watch=1 ;;
+      run) verb_run=1 ;;
+      unit) verb_unit=1 ;;
+      and) verb_and=1 ;;
+    esac
+    verb_before=$verb_last
+    verb_last=$verb_token
+  done
+  case "$1" in
+    dev|dev:*|dev-*|start|start:*|serve|serve:*|preview|studio|db:studio|\
+    up|up-*|down|down-*|logs|logs-*|shell|ps|status|clean|help)
+      verb_class=light
+      return 1 ;;
+  esac
+  if [ "$verb_ends" = 0 ]; then
+    if [ "$verb_run" = 0 ]; then
+      if [ "$verb_watch" = 1 ]; then
+        verb_class=light
+        return 1
+      fi
+      # A make target has no interactive mode: `make test-ui` is a suite.
+      if [ "$verb_unit" = 0 ] && [ "$self" != make ]; then
+        case "$verb_last:$verb_before" in
+          ui:test|ui:tests|ui:e2e|ui:vitest|ui:jest|ui:pytest|ui:playwright|ui:watch|\
+          serve:test|serve:tests|serve:e2e|serve:vitest|serve:jest|serve:pytest|serve:playwright|serve:watch|\
+          debug:test|debug:tests|debug:e2e|debug:vitest|debug:jest|debug:pytest|debug:playwright|debug:watch)
+            verb_class=light
+            return 1 ;;
+        esac
+      fi
+    fi
+  fi
+  # `lint-and-test` and `format:and:build` run the tests after the check.
+  if [ "$verb_first" = light ] && [ "$verb_and_heavy" = 1 ]; then verb_first=heavy; fi
+  if [ "$verb_first" = heavy ]; then verb_class=heavy; return 0; fi
+  if [ "$verb_first" = light ]; then verb_class=light; return 1; fi
+  if [ "$verb_weak" = 0 ]; then verb_class=heavy; fi
+  return "$verb_weak"
+}
+
+# Launcher options whose value is the next argument, so that value is never the
+# verb. Taken from each tool's own help; the verb scan reads an option missing
+# here as a flag and corrects for it (see is_known_verb). One list per tool
+# family, read by the verb scan and, through option_names_dir, the directory scan.
+option_takes_value() {
+  case "$self" in
+    uv)
+      case "$1" in
+        --directory|--project|--config-file|--cache-dir|--color|--allow-insecure-host|\
+        -C|--config-setting|--config-settings-package|-p|--python|--python-platform|\
+        --package|--with|-w|--with-editable|--with-requirements|--extra|--no-extra|\
+        --group|--no-group|--only-group|--env-file|--from|\
+        -c|--constraints|-b|--build-constraints|--overrides|\
+        --index|--default-index|-i|--index-url|--extra-index-url|-f|--find-links|\
+        --index-strategy|--keyring-provider|--resolution|--prerelease|--fork-strategy|\
+        --exclude-newer|--exclude-newer-package|--link-mode|-P|--upgrade-package|\
+        --reinstall-package|--refresh-package|--no-binary-package|--no-build-package|\
+        --no-build-isolation-package)
+          return 0 ;;
+      esac ;;
+    poetry)
+      case "$1" in
+        -C|--directory|-P|--project) return 0 ;;
+      esac ;;
+    npx)
+      case "$1" in
+        --prefix|-C|--workspace|--filter|-F|--loglevel|--registry|--userconfig|--cache|--dir|--cwd|\
+        -w|-p|--package|-c|--call|--node-arg|--shell)
+          return 0 ;;
+      esac ;;
+    *)
+      case "$1" in
+        --prefix|-C|--workspace|--filter|--filter-prod|-F|--loglevel|--registry|--userconfig|--cache|\
+        --dir|--cwd|--reporter|--workspace-concurrency|--test-pattern|--changed-files-ignore-pattern|\
+        --include|--exclude|--from|--to|--otp|--tag|--scope|--env-file)
+          return 0 ;;
+        # npm's --workspace takes a name; pnpm's --workspace-root takes none.
+        -w) [ "$self" = npm ] && return 0 ;;
+      esac ;;
+  esac
+  return 1
+}
+
+# Launcher options that change the directory the tool acts in. In particular,
+# Playwright's --project=chromium is a test project, not a directory, and uv's
+# -C and -P are --config-setting and --upgrade-package.
+option_names_dir() {
+  case "$1" in
+    --dir|--cwd|--prefix|--directory) return 0 ;;
+    -C) [ "$self" != uv ] && return 0 ;;
+    --project) case "$self" in uv|poetry) return 0 ;; esac ;;
+    -P) [ "$self" = poetry ] && return 0 ;;
+  esac
+  return 1
+}
+
+# The tools' own verbs that are not verification and do not end in a decisive
+# token. After an option the verb scan cannot tell a value from a verb, so a word
+# that is neither decisive nor one of these is taken for a value and the scan
+# moves on: reading `--reporter append-only test` as the verb `append-only` would
+# leave the tests ungated, while reading `--silent install` as a value would gate
+# the install of a package named test-utils.
+is_known_verb() {
+  case "$1" in
+    install|i|add|update|up|upgrade|remove|rm|uninstall|un|outdated|audit|link|unlink|\
+    publish|pack|init|create|config|cache|list|ls|why|view|info|prune|dedupe|rebuild|\
+    patch|store|fetch|env|import|login|logout|whoami|version|\
+    t|tst|it|cit|install-test|install-ci-test|\
+    sync|lock|pip|python*|venv|export|tree|self|show|new|search|about|source|shell)
+      return 0 ;;
+  esac
+  return 1
+}
+
+# `npx -c 'vitest run'` and `npm exec -c '...'` run a command string: its first
+# word is the verb.
+option_is_call() {
+  case "$1" in -c|--call) ;; *) return 1 ;; esac
+  case "$self" in
+    npx) return 0 ;;
+    npm) [ "$unwrapped" = 1 ] && return 0 ;;
+  esac
+  return 1
+}
+
+call_first_word() {
+  # The string is not scanned for flags later, so its watch flags are read here.
+  set -f
+  for call_flag in $1; do
+    if is_watch_flag "$call_flag"; then call_watch=1; fi
+  done
+  set +f
+  call_text=$1
+  while [ "${call_text# }" != "$call_text" ]; do call_text=${call_text# }; done
+  strip_version "${call_text%% *}"
+  sub=$name_out
+}
+
+# The flags that make a runner a watcher; a false value is not one.
+is_watch_flag() {
+  case "$1" in
+    --watch=false|--watch=0|--watchAll=false|--watchAll=0) return 1 ;;
+    --watch|--watch=*|--watchAll|--watchAll=*|--ui|--serve) return 0 ;;
+  esac
+  return 1
+}
+
+# A package spec names its version after the last @ (`vitest@latest`,
+# `@playwright/test@1.50`); a scoped name alone keeps its leading @. Sets
+# name_out, and maps Playwright's package to its command.
+strip_version() {
+  name_out=$1
+  case "$name_out" in
+    [!@]*@*|@?*/*@*) name_out=${name_out%@*} ;;
+  esac
+  case "$name_out" in @playwright/test) name_out=playwright ;; esac
+}
+
+# Options of vitest and playwright whose value is the next argument. An option
+# missing here is read as a flag, and a word after it counts as the runner's
+# command only when it is one (see the classification below). Vitest's --browser
+# is a flag, so it is left out: only --browser=NAME carries a value.
+runner_takes_value() {
+  case "$1" in
+    -c|--config|-r|--root|--dir|--reporter|--outputFile|--mode|--environment|--pool|--project|--shard|\
+    -t|--testNamePattern|--testTimeout|--hookTimeout|--retry|--workspace|\
+    --grep|-g|--grep-invert|--workers|-j|--retries|--timeout|--output|--max-failures|--repeat-each|\
+    --trace|-b|--tsconfig)
+      return 0 ;;
+  esac
+  return 1
+}
+
+# ---------------------------------------------------------------- subcommand
+# What the tool was actually asked to do, normalised across ecosystems.
+sub=""
+builtin=0
+launcher_dir=""
+call_watch=0
+case "$self" in
+  npm|pnpm|yarn|bun|npx|uv|poetry)
+    # Options come before the verb, so read past them first. `npm --prefix client
+    # run lint` used to classify as `--prefix`, which is no verb at all, so every
+    # client-side gate landed in the fallback below. The options that name a
+    # directory are recorded on the way. Scanned without shifting: bash 3.2, which
+    # is /bin/sh here, cannot parse a `case` inside a `$( )`.
+    skip_next=0
+    skip_dir=0
+    skip_call=0
+    skip_operand=0
+    after_option=0
+    unwrapped=0
+    case "$self" in
+      uv|poetry) wrappers=" run " ;;
+      *) wrappers=" run run-script exec dlx x " ;;
+    esac
+    for a in "$@"; do
+      if [ "$skip_next" = 1 ]; then
+        skip_next=0
+        if [ "$skip_dir" = 1 ]; then launcher_dir=$a; skip_dir=0; fi
+        if [ "$skip_call" = 1 ]; then call_first_word "$a"; break; fi
+        continue
+      fi
+      case "$a" in
+        --) after_option=0; continue ;;
+        --*=*)
+          if option_names_dir "${a%%=*}"; then launcher_dir=${a#*=}; fi
+          if option_is_call "${a%%=*}"; then call_first_word "${a#*=}"; break; fi
+          after_option=0
+          continue ;;
+        -*)
+          # A short option may carry its value: -Cdir.
+          opt=$a
+          attached=""
+          case "$a" in -[!-]?*) opt=${a%"${a#??}"}; attached=${a#??} ;; esac
+          if option_names_dir "$opt"; then
+            if [ -n "$attached" ]; then launcher_dir=$attached; else skip_next=1; skip_dir=1; fi
+            after_option=0
+          elif option_is_call "$opt"; then
+            if [ -n "$attached" ]; then call_first_word "$attached"; break; fi
+            skip_next=1
+            skip_call=1
+          elif option_takes_value "$opt"; then
+            if [ -z "$attached" ]; then skip_next=1; fi
+            after_option=0
+          else
+            after_option=1
+          fi
+          continue ;;
+      esac
+      # `yarn workspace NAME ...` names a workspace, and the verb follows it.
+      if [ "$skip_operand" = 1 ]; then skip_operand=0; after_option=0; continue; fi
+      case "$self:$a" in
+        yarn:workspace) skip_operand=1; after_option=0; continue ;;
+        yarn:workspaces|yarn:foreach|pnpm:recursive|pnpm:multi|uv:tool) after_option=0; continue ;;
+      esac
+      if [ "$unwrapped" = 0 ]; then
+        case "$wrappers" in *" $a "*) unwrapped=1; after_option=0; continue ;; esac
+      fi
+      # npx runs the first word that is not an option, whatever precedes it.
+      # `pnpm exec -c 'vitest run'` and `yarn exec 'vitest run'` pass one string.
+      name_out=$a
+      case "$a" in *" "*) call_first_word "$a"; name_out=$sub ;; esac
+      strip_version "$name_out"
+      if [ "$after_option" = 1 ] && [ "$self" != npx ]; then
+        after_option=0
+        verification_verb "$name_out" || :
+        if [ "$verb_class" = none ] && ! is_known_verb "$name_out"; then continue; fi
+      fi
+      sub=$name_out
+      break
+    done
+    if [ "$unwrapped" = 0 ]; then
+      # Aliases of `test`; `it` and `cit` install first.
+      case "$self:$sub" in
+        npm:t|npm:tst|npm:it|npm:cit|npm:install-test|npm:install-ci-test|\
+        pnpm:t|pnpm:tst|pnpm:it|pnpm:install-test)
+          sub=test ;;
+      esac
+      # Built-in install and query verbs move packages over the network, and
+      # `poetry check` only validates pyproject.toml (Yarn Berry's `check` runs the
+      # project's script); they are not verification, even when a project also has
+      # a `ci` or `audit` script.
+      case "$self:$sub" in
+        poetry:check|\
+        npm:ci|npm:install|npm:i|npm:audit|npm:update|npm:up|npm:outdated|\
+        pnpm:install|pnpm:i|pnpm:add|pnpm:audit|pnpm:update|pnpm:up|pnpm:outdated|\
+        bun:install|bun:i|bun:add|bun:update|bun:outdated|bun:ci)
+          builtin=1 ;;
+      esac
+    fi
+    ;;
+  make)
+    # The first real target; option values and overrides are not targets.
+    sub=${make_targets%%
+*}
+    ;;
+  pytest|vitest|playwright)
+    sub="__runner__"
+    ;;
+esac
+
+# Recognize test modules behind Python launchers, without intercepting arbitrary
+# Python programs or treating their arguments as verification commands.
+python_name=${sub##*/}
+case "$self:$python_name" in
+  uv:python*|poetry:python*)
+    python_seen=0
+    python_value=0
+    python_module=0
+    for a in "$@"; do
+      if [ "$python_seen" = 0 ]; then
+        [ "$a" != "$sub" ] || python_seen=1
+        continue
+      fi
+      if [ "$python_module" = 1 ]; then
+        case "$a" in pytest|unittest|ruff|mypy|basedpyright|pyright) sub=$a ;; esac
+        break
+      fi
+      if [ "$python_value" = 1 ]; then python_value=0; continue; fi
+      case "$a" in
+        -m) python_module=1 ;;
+        -X|-W) python_value=1 ;;
+        -c|--|-|[!-]*) break ;;
+      esac
+    done
+    ;;
+esac
+
+# ------------------------------------------------------------ classification
+heavy=0
+
+# A watch flag means a long-lived process, whatever the subcommand says. `-w` is
+# one only where a watcher reads it: to make it prints the directory, to uv it is
+# --with, and npm reads it as --workspace unless it follows `--`. The first
+# positional after vitest or playwright is that runner's own command, once the
+# values of options before it are skipped.
+watching=$call_watch
+past_sub=0
+past_dashdash=0
+runner=""
+runner_cmd=""
+loop_skip=0
+loop_after=0
+case "$self" in vitest|playwright) runner=$self ;; esac
+for a in "$@"; do
+  if [ "$loop_skip" = 1 ]; then loop_skip=0; continue; fi
+  if is_watch_flag "$a"; then watching=1; break; fi
+  case "$a" in
+    --) past_dashdash=1; continue ;;
+    -w)
+      case "$self" in
+        make|pytest|playwright) ;;
+        vitest) watching=1 ;;
+        npm) [ "$past_dashdash" = 0 ] || watching=1 ;;
+        *) [ "$past_sub" = 0 ] || watching=1 ;;
+      esac
+      [ "$watching" = 0 ] || break
+      continue ;;
+    --*=*) loop_after=0; continue ;;
+    -*)
+      if [ -n "$runner" ]; then
+        if runner_takes_value "$a"; then loop_skip=1; loop_after=0; else loop_after=1; fi
+      elif [ "$past_sub" = 0 ] && option_takes_value "$a"; then
+        loop_skip=1
+      fi
+      continue ;;
+  esac
+  if [ -n "$runner" ]; then
+    if [ -z "$runner_cmd" ]; then
+      if [ "$loop_after" = 1 ]; then
+        # After an option that may be a flag, only a command of the runner counts.
+        case "$a" in
+          run|watch|dev|related|bench|typecheck|init|list|test|show-report|show-trace|codegen|open|\
+          install|install-deps|uninstall|merge-reports|cr|ff|wk) runner_cmd=$a ;;
+        esac
+      else
+        runner_cmd=$a
+      fi
+    fi
+    loop_after=0
+  elif [ "$past_sub" = 0 ]; then
+    strip_version "$a"
+    if [ "$name_out" = "$sub" ]; then
+      past_sub=1
+      case "$name_out" in vitest|playwright) runner=$name_out ;; esac
+    fi
+  fi
+done
+case "$runner:$runner_cmd" in
+  vitest:watch|vitest:dev) watching=1 ;;
+  vitest:run|vitest:list|vitest:init) ;;
+  vitest:*)
+    # Vitest watches by default when stdin is a terminal and CI is unset, so a
+    # bare `vitest` in the owner's terminal is a watcher.
+    vitest_once=0
+    for a in "$@"; do
+      case "$a" in --run|--watch=false|--watch=0|--no-watch) vitest_once=1 ;; esac
+    done
+    if [ "$vitest_once" = 0 ] && [ -z "${CI:-}" ] && [ -t 0 ]; then
+      watching=1
+    fi ;;
+esac
+
+if verification_verb "$sub"; then heavy=1; fi
+
+# Asking a runner for its version, its help or the list of tests it would run
+# starts no tests.
+case "$sub" in
+  __runner__|pytest|vitest|jest|playwright|unittest)
+    for a in "$@"; do
+      case "$a" in
+        --) break ;;
+        --version|-V|--help|-h|--collect-only|--co) heavy=0; break ;;
+      esac
+    done ;;
+esac
+
+# Playwright's report server, trace viewer and recorder are long-lived and
+# interactive; its browser installer is a download.
+case "$runner:$runner_cmd" in
+  playwright:show-report|playwright:show-trace|playwright:codegen|playwright:open|playwright:cr|playwright:ff|playwright:wk|\
+  playwright:install|playwright:install-deps|playwright:uninstall|playwright:merge-reports)
+    heavy=0 ;;
+esac
+if [ "$builtin" = 1 ]; then
+  heavy=0
+fi
+
+# Make can execute several targets; the first target does not hide later work.
+if [ "$self" = make ]; then
+  while IFS= read -r a; do
+    if verification_verb "$a"; then heavy=1; fi
+  done <<MAKE_TARGETS
+$make_targets
+MAKE_TARGETS
+fi
+
+# A dry run or a question starts no recipe.
+if [ "$make_dry" = 1 ]; then
+  heavy=0
+fi
+
+# A watcher is long-lived whatever its verb says: it must never hold tokens.
+if [ "$watching" -eq 1 ]; then
+  heavy=0
+fi
+
+# ------------------------------------------------------------ repository
+# The directory the tool will act in: only launcher options before its verb can
+# redirect it (option_names_dir). Make's directory comes from the target parse
+# above, which also reads -C after VAR=VALUE overrides; the launchers' from the
+# verb scan.
+target_dir="$PWD"
+case "$self" in
+  make) target_dir="$make_dir" ;;
+  pytest|vitest|playwright)
+    next_dir=0
+    for a in "$@"; do
+      if [ "$next_dir" = 1 ]; then
+        target_dir="$a"
+        next_dir=0
+        continue
+      fi
+      case "$a" in
+        --*=*) if option_names_dir "${a%%=*}"; then target_dir=${a#*=}; fi ;;
+        -C?*) target_dir=${a#-C} ;;
+        -*) if option_names_dir "$a"; then next_dir=1; fi ;;
+        *) break ;;
+      esac
+    done ;;
+  *) [ -z "$launcher_dir" ] || target_dir="$launcher_dir" ;;
+esac
+case "$target_dir" in
+  /*) ;;
+  *) target_dir="$PWD/$target_dir" ;;
+esac
+target_dir=$(CDPATH='' cd -- "$target_dir" 2>/dev/null && pwd -P || printf '%s' "$target_dir")
+
+# The enclosing checkout: the nearest directory holding `.git` (a directory, or
+# a worktree's file). Found without running git.
+root=""
+walk="$target_dir"
+while [ -n "$walk" ]; do
+  if [ -e "$walk/.git" ]; then
+    root="$walk"
+    break
+  fi
+  [ "$walk" = / ] && break
+  walk=${walk%/*}
+  [ -z "$walk" ] && walk=/
+done
+
+owned=0
+if [ -n "$root" ] && [ -f "$root/.agent-admission" ]; then
+  owned=1
+fi
+
+# ------------------------------------------------------------------ dispatch
+# A repository's marker covers what its own guards cover: its make targets and
+# its test entry points. A bundler it runs as a package script or directly is
+# guarded by neither, so it falls through to the gate (gosquash#895 and
+# get5stars#883 reviews, 2026-09-30).
+if [ "$heavy" -eq 1 ] && [ "$owned" = 1 ]; then
+  repo_entry=0
+  case "$self" in make|pytest|vitest|playwright) repo_entry=1 ;; esac
+  case "$sub" in
+    test|test:*|test-*|*-test|*-tests|tests|verify|verify:*|verify-*|*-verify|\
+    e2e|e2e:*|e2e-*|*-e2e|vitest|jest|pytest|playwright)
+      repo_entry=1 ;;
+  esac
+  if [ "$repo_entry" = 1 ]; then
+    explain owned
+    exec "$real" "$@"
+  fi
+fi
+
+if [ "$heavy" -eq 1 ]; then
+  gate="$shared_bin/agent-gate"
+  if [ -x "$gate" ]; then
+    explain gate
+    # A Claude Code Bash call that outlives its timeout is backgrounded, not
+    # killed, and Codex's unified exec keeps the process running after it
+    # yields, so waiting in the queue never strands an agent.
+    exec "$gate" -l "$self${sub:+ $sub}" -- "$real" "$@"
+  fi
+  echo "devshim: agent-gate is unavailable; nothing ran." >&2
+  exit 78
+fi
+
+explain direct
+exec "$real" "$@"

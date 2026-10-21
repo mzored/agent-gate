@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""Run a heavy command when this machine has room for it; see lib/agent_gate.py."""
+
+from pathlib import Path
+import sys
+
+if sys.platform != "darwin":
+    raise SystemExit("agent-gate requires macOS")
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import agent_gate  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(agent_gate.main())
