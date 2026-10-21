@@ -16,7 +16,6 @@ import sys
 import tempfile
 import textwrap
 import time
-import types
 from typing import Callable, Dict, List, NamedTuple, Optional, Sequence
 import unittest
 import unittest.mock
@@ -27,6 +26,7 @@ sys.path.insert(0, str(ROOT / "lib"))
 import agent_gate  # noqa: E402
 import gate_macos  # noqa: E402
 import gate_host  # noqa: E402
+import gate_policy  # noqa: E402
 
 PY = sys.executable
 # A shell starts background jobs with SIGINT ignored, and an ignored signal stays
@@ -299,114 +299,143 @@ class GateCase(unittest.TestCase):
         return gate_macos.process_info(pid) is None
 
 
-class RefusalTest(unittest.TestCase):
-    """The admission rule, decided on a snapshot of tokens and the kernel's memory signal."""
+class PolicyTest(unittest.TestCase):
+    """The admission rule and the fan-out, decided on a snapshot of the live runs and the kernel's memory signal."""
 
     NOW = 1_000_000.0
 
-    def decide(self, used: float, pressure: Optional[int], free: Optional[int], since: float = 60.0, k: int = 2,
-               ahead: Sequence[Dict[str, object]] = (), outside: Optional[float] = None,
-               swapout: Optional[float] = 0.0, **environ: str) -> Optional[str]:
-        """`outside` is the tokens of runs not admitted into the headroom: all of `used` by default, up to T."""
+    def decision(self, used: float, pressure: Optional[int], free: Optional[int], since: float = 60.0, k: int = 2,
+                 ahead: Sequence[Dict[str, object]] = (), outside: Optional[float] = None,
+                 swapout: Optional[float] = 0.0, grow: bool = False, workers: Optional[float] = None,
+                 **environ: str) -> gate_policy.Decision:
+        """`used` tokens held by live runs, `outside` of them not in the headroom (all of `used` up to T by
+        default), and `workers` the CPUs their runners use (their tokens by default)."""
         settings = agent_gate.Settings({"AGENT_GATE_TOKENS": "10", "AGENT_GATE_MIN_FREE_PCT": "25", **environ})
         outside = min(used, settings.tokens) if outside is None else outside
-        snapshot = types.SimpleNamespace(used=used, outside_headroom=outside, pressure=pressure, free=free,
-                                         swapout=swapout, since_admit=since)
-        return agent_gate.refusal(snapshot, k, settings, ahead, self.NOW)  # type: ignore[arg-type]
+        jobs: List[Dict[str, object]] = []
+        if outside:
+            jobs.append({"k": outside, "workers": outside if workers is None else workers})
+        if used - outside:
+            jobs.append({"k": used - outside, "headroom": True})
+        snapshot = gate_policy.Snapshot(jobs, pressure, free, swapout, since)
+        return gate_policy.decide(snapshot, k, settings, ahead, self.NOW, grow)
+
+    def decide(self, *args, **kwargs) -> str:
+        return self.decision(*args, **kwargs).code
 
     def waiter(self, k: int, waited: float = 1.0) -> Dict[str, object]:
-        """A request queued ahead, as this version's gate records it."""
-        return {"protocol": agent_gate.PROTOCOL, "k": k, "queued": self.NOW - waited}
+        """A request queued ahead."""
+        return {"k": k, "queued": self.NOW - waited}
 
     def test_one_run_always_starts_on_an_idle_machine_unless_pressure_is_critical(self):
-        self.assertIsNone(self.decide(0, 2, 5))
-        self.assertIsNone(self.decide(0, None, None))
-        self.assertIn("critical", self.decide(0, 4, 80) or "")
+        self.assertEqual(self.decide(0, 2, 5), "start")
+        self.assertEqual(self.decide(0, None, None), "start")
+        self.assertEqual(self.decide(0, 4, 80), "critical")
 
     def test_warning_pressure_alone_does_not_throttle(self):
-        self.assertIsNone(self.decide(8, 2, 25))
+        self.assertEqual(self.decide(8, 2, 25), "start")
 
     def test_tokens_free_memory_and_ramp_limit_concurrent_runs(self):
-        self.assertIn("tokens", self.decide(9, 1, 80) or "")
-        self.assertIn("below 25%", self.decide(2, 1, 24) or "")
-        self.assertIn("below 30%", self.decide(2, 1, 29, AGENT_GATE_MIN_FREE_PCT="30") or "")
-        self.assertIn("starting", self.decide(2, 1, 30, since=1.0) or "")
-        self.assertIsNone(self.decide(2, 1, 30, since=1.0, AGENT_GATE_RAMP_SECONDS="0"))
-        self.assertIn("unavailable", self.decide(1, None, None) or "")
-        self.assertIn("critical", self.decide(1, 4, 80) or "")
-        self.assertIn("measuring", self.decide(1, 1, 80, swapout=None) or "")
-        self.assertIsNone(self.decide(0, 1, 80, swapout=None), "an idle host starts one run without measuring")
+        self.assertEqual(self.decide(9, 1, 80), "tokens")
+        self.assertEqual(self.decide(2, 1, 24), "free")
+        self.assertEqual(self.decide(2, 1, 29, AGENT_GATE_MIN_FREE_PCT="30"), "free")
+        self.assertEqual(self.decide(2, 1, 30, since=1.0), "ramp")
+        self.assertEqual(self.decide(2, 1, 30, since=1.0, AGENT_GATE_RAMP_SECONDS="0"), "start")
+        self.assertEqual(self.decide(1, None, None), "unreadable")
+        self.assertEqual(self.decide(1, 4, 80), "critical")
+        self.assertEqual(self.decide(1, 1, 80, swapout=None), "measuring")
+        self.assertEqual(self.decide(1, 1, 80, swapout=50), "swap")
+        self.assertEqual(self.decide(0, 1, 80, swapout=None), "start", "an idle host starts one run without measuring")
+
+    def test_a_one_token_run_beside_others_is_held_only_by_measured_harm(self):
+        self.assertEqual(self.decide(2, 1, 10, k=1), "start", "low free memory is a prediction")
+        self.assertEqual(self.decide(2, 1, 30, since=0.0, k=1), "start", "the ramp spaces larger claims")
+        self.assertEqual(self.decide(2, 1, 80, swapout=None, k=1), "start", "no rate measured is no harm")
+        self.assertEqual(self.decide(2, 1, 80, swapout=50, k=1), "swap")
+        self.assertEqual(self.decide(2, 4, 80, k=1), "critical")
+        self.assertEqual(self.decide(2, None, None, k=1), "unreadable")
 
     def test_the_ramp_spaces_admissions_only_while_free_memory_is_thin(self):
         # Free memory within 10 points of the 25% minimum, or unreadable, is thin.
-        self.assertIn("starting", self.decide(2, 1, 34, since=1.0) or "")
-        self.assertIsNone(self.decide(2, 1, 35, since=1.0))
-        self.assertIsNone(self.decide(2, 1, 80, since=0.0))
-        self.assertIsNone(self.decide(2, 1, 30, since=1.0, AGENT_GATE_RAMP_MARGIN_PCT="0"))
-        self.assertIn("starting", self.decide(2, 1, 50, since=1.0, AGENT_GATE_RAMP_MARGIN_PCT="30") or "")
+        self.assertEqual(self.decide(2, 1, 34, since=1.0), "ramp")
+        self.assertEqual(self.decide(2, 1, 35, since=1.0), "start")
+        self.assertEqual(self.decide(2, 1, 80, since=0.0), "start")
+        self.assertEqual(self.decide(2, 1, 30, since=1.0, AGENT_GATE_RAMP_MARGIN_PCT="0"), "start")
+        self.assertEqual(self.decide(2, 1, 50, since=1.0, AGENT_GATE_RAMP_MARGIN_PCT="30"), "ramp")
 
     def test_one_token_runs_have_headroom_beyond_the_pool(self):
-        self.assertIsNone(self.decide(10, 1, 80, k=1))
-        self.assertIsNone(self.decide(11, 1, 80, k=1))
-        self.assertIn("12 of 10 tokens in use (+2 for 1-token runs), 1 needed", self.decide(12, 1, 80, k=1) or "")
-        self.assertIn("10 of 10 tokens in use, 2 needed", self.decide(10, 1, 80, k=2) or "")
-        self.assertIn("tokens", self.decide(9, 1, 80, k=2) or "", "small runs in the headroom count for larger claims")
-        self.assertIn("tokens", self.decide(10, 1, 80, k=1, AGENT_GATE_SMALL_HEADROOM="0") or "")
-        self.assertIn("below 25%", self.decide(10, 1, 10, k=1) or "", "the headroom keeps the memory rules")
+        self.assertEqual(self.decide(10, 1, 80, k=1), "start")
+        self.assertTrue(self.decision(10, 1, 80, k=1).headroom)
+        self.assertEqual(self.decide(11, 1, 80, k=1), "start")
+        self.assertEqual(self.decision(12, 1, 80, k=1).reason, "12 of 10 tokens in use (+2 for 1-token runs), 1 needed")
+        self.assertEqual(self.decide(10, 1, 80, k=2), "tokens")
+        self.assertEqual(self.decide(9, 1, 80, k=2), "tokens", "small runs in the headroom count for larger claims")
+        self.assertEqual(self.decide(10, 1, 80, k=1, AGENT_GATE_SMALL_HEADROOM="0"), "tokens")
         for tokens, headroom in (("1", 1), ("4", 1), ("10", 2), ("16", 3)):
             self.assertEqual(agent_gate.Settings({"AGENT_GATE_TOKENS": tokens}).headroom, headroom)
 
     def test_a_later_request_passes_only_requests_that_wait_for_tokens_alone(self):
         head = [self.waiter(5)]
-        self.assertIsNone(self.decide(8, 1, 80, k=1, ahead=head))
-        self.assertIsNone(self.decide(8, 1, 80, k=2, ahead=head))
-        self.assertIn("tokens", self.decide(8, 1, 80, k=3, ahead=head) or "")
-        self.assertIn("fits goes first", self.decide(5, 1, 80, k=1, ahead=head) or "")
-        self.assertIn("fits goes first", self.decide(0, 1, 80, k=1, ahead=head) or "")
-        self.assertIn("fits goes first", self.decide(11, 1, 80, k=1, ahead=head + [self.waiter(1)]) or "",
-                      "a 1-token request ahead that fits its headroom goes first")
+        self.assertEqual(self.decide(8, 1, 80, k=1, ahead=head), "start")
+        self.assertTrue(self.decision(8, 1, 80, k=1, ahead=head).backfilled)
+        self.assertEqual(self.decide(8, 1, 80, k=2, ahead=head), "start")
+        self.assertEqual(self.decide(8, 1, 80, k=3, ahead=head), "tokens")
+        self.assertEqual(self.decide(5, 1, 80, k=1, ahead=head), "fits-first")
+        self.assertEqual(self.decide(0, 1, 80, k=1, ahead=head), "fits-first")
+        self.assertEqual(self.decide(11, 1, 80, k=1, ahead=head + [self.waiter(1)]), "fits-first",
+                         "a 1-token request ahead that fits its headroom goes first")
         # Memory and the ramp hold the head and the later request alike.
-        self.assertIn("below 25%", self.decide(8, 1, 10, k=1, ahead=head) or "")
-        self.assertIn("starting", self.decide(8, 1, 30, since=1.0, k=1, ahead=head) or "")
-        self.assertIn("critical", self.decide(8, 4, 80, k=1, ahead=head) or "")
+        self.assertEqual(self.decide(8, 1, 10, k=2, ahead=head), "free")
+        self.assertEqual(self.decide(8, 1, 30, since=1.0, k=2, ahead=head), "ramp")
+        self.assertEqual(self.decide(8, 4, 80, k=1, ahead=head), "critical")
 
     def test_only_a_one_token_run_into_a_full_pools_headroom_passes_an_aged_request(self):
         aged = [self.waiter(5, waited=60)]
-        self.assertIn("waited over 60s", self.decide(8, 1, 80, k=1, ahead=aged) or "")
-        self.assertIn("waited over 60s", self.decide(9, 1, 80, k=1, ahead=aged) or "")
+        self.assertEqual(self.decide(8, 1, 80, k=1, ahead=aged), "aged")
+        self.assertEqual(self.decide(9, 1, 80, k=1, ahead=aged), "aged")
         # Runs outside the headroom hold all T tokens: the aged request cannot start before one of
         # them ends, so a 1-token run may take the headroom.
-        self.assertIsNone(self.decide(10, 1, 80, k=1, ahead=aged))
-        self.assertIsNone(self.decide(11, 1, 80, k=1, ahead=aged))
+        self.assertEqual(self.decide(10, 1, 80, k=1, ahead=aged), "start")
+        self.assertEqual(self.decide(11, 1, 80, k=1, ahead=aged), "start")
         # Headroom runs fill the pool: once a run outside the headroom has ended, nothing passes.
-        self.assertIn("waited over 60s", self.decide(10, 1, 80, k=1, ahead=aged, outside=9) or "")
-        self.assertIn("waited over 60s", self.decide(11, 1, 80, k=1, ahead=aged, outside=9) or "")
-        self.assertIn("waited over 60s", self.decide(12, 1, 80, k=1, ahead=aged) or "", "the headroom is full")
-        self.assertIn("waited over 60s", self.decide(10, 1, 80, k=1, ahead=aged, AGENT_GATE_SMALL_HEADROOM="0") or "")
-        self.assertIn("waited over 60s", self.decide(10, 1, 80, k=2, ahead=aged) or "")
-        self.assertIn("fits goes first", self.decide(10, 1, 80, k=1, ahead=[self.waiter(1, waited=60)]) or "")
-        # Memory and the ramp still hold it.
-        self.assertIn("below 25%", self.decide(10, 1, 10, k=1, ahead=aged) or "")
-        self.assertIn("starting", self.decide(10, 1, 30, since=1.0, k=1, ahead=aged) or "")
-        self.assertIn("critical", self.decide(10, 4, 80, k=1, ahead=aged) or "")
+        self.assertEqual(self.decide(10, 1, 80, k=1, ahead=aged, outside=9), "aged")
+        self.assertEqual(self.decide(11, 1, 80, k=1, ahead=aged, outside=9), "aged")
+        self.assertEqual(self.decide(12, 1, 80, k=1, ahead=aged), "aged", "the headroom is full")
+        self.assertEqual(self.decide(10, 1, 80, k=1, ahead=aged, AGENT_GATE_SMALL_HEADROOM="0"), "aged")
+        self.assertEqual(self.decide(10, 1, 80, k=2, ahead=aged), "aged")
+        self.assertEqual(self.decide(10, 1, 80, k=1, ahead=[self.waiter(1, waited=60)]), "fits-first")
+        # Measured harm still holds it.
+        self.assertEqual(self.decide(10, 1, 80, swapout=50, k=1, ahead=aged), "swap")
+        self.assertEqual(self.decide(10, 4, 80, k=1, ahead=aged), "critical")
 
-    def test_nothing_passes_an_aged_request_or_an_older_gates_while_tokens_are_free(self):
-        self.assertIn("waited over 60s", self.decide(8, 1, 80, k=1, ahead=[self.waiter(5, waited=60)]) or "")
-        self.assertIn("waited over 60s", self.decide(8, 1, 80, k=1, ahead=[self.waiter(1), self.waiter(5, 61)]) or "")
-        self.assertIsNone(self.decide(8, 1, 80, k=1, ahead=[self.waiter(5, waited=60)],
-                                      AGENT_GATE_BACKFILL_SECONDS="61"))
-        self.assertIn("waited over 0s", self.decide(8, 1, 80, k=1, ahead=[self.waiter(5, waited=0)],
-                                                    AGENT_GATE_BACKFILL_SECONDS="0") or "")
-        older = {"k": 5, "queued": self.NOW}
-        for record in (older, {**self.waiter(5), "k": None}, {}):
+    def test_nothing_passes_an_aged_or_malformed_request_while_tokens_are_free(self):
+        self.assertEqual(self.decide(8, 1, 80, k=1, ahead=[self.waiter(5, waited=60)]), "aged")
+        self.assertEqual(self.decide(8, 1, 80, k=1, ahead=[self.waiter(1), self.waiter(5, 61)]), "aged")
+        self.assertEqual(self.decide(8, 1, 80, k=1, ahead=[self.waiter(5, waited=60)],
+                                     AGENT_GATE_BACKFILL_SECONDS="61"), "start")
+        self.assertEqual(self.decide(8, 1, 80, k=1, ahead=[self.waiter(5, waited=0)],
+                                     AGENT_GATE_BACKFILL_SECONDS="0"), "aged")
+        for record in ({**self.waiter(5), "k": None}, {}):
             with self.subTest(record=record):
-                self.assertIn("older gate", self.decide(8, 1, 80, k=1, ahead=[record]) or "")
-                self.assertIn("older gate", self.decide(10, 1, 80, k=1, ahead=[record]) or "")
+                self.assertEqual(self.decide(8, 1, 80, k=1, ahead=[record]), "malformed")
+
+    def test_a_default_claim_gets_the_cpus_no_other_run_uses(self):
+        self.assertEqual(self.decision(0, 1, 80, grow=True).workers, 10, "alone: the whole machine")
+        self.assertEqual(self.decision(0, 1, 80).workers, 2, "an explicit claim keeps its size")
+        self.assertEqual(self.decision(2, 1, 80, grow=True, workers=7).workers, 3)
+        self.assertEqual(self.decision(2, 1, 80, grow=True, workers=10).workers, 2, "never below its claim")
+        self.assertEqual(self.decision(0, 1, 80, grow=True, swapout=None).workers, 10, "no rate measured is no harm")
+        for memory in ({"free": 10}, {"swapout": 50}, {"pressure": 4}, {"free": None}):
+            with self.subTest(memory=memory):
+                snapshot = gate_policy.Snapshot([], **{"pressure": 1, "free": 80, "swapout": 0.0, **memory},
+                                                since_admit=60.0)
+                self.assertEqual(gate_policy.fan_out(snapshot, 2, True, agent_gate.Settings({"AGENT_GATE_TOKENS": "10",
+                                 "AGENT_GATE_MIN_FREE_PCT": "25"})), 2, "memory without room keeps the claim")
 
     def test_an_unreadable_pressure_level_leaves_the_free_memory_rule(self):
         # Inside the Codex sandbox only the free share is readable.
-        self.assertIsNone(self.decide(2, None, 80))
-        self.assertIn("below 25%", self.decide(2, None, 10) or "")
+        self.assertEqual(self.decide(2, None, 80), "start")
+        self.assertEqual(self.decide(2, None, 10), "free")
 
     def test_the_free_share_leaves_out_app_memory_the_compressor_holds(self):
         # 60 truly free (free_count includes the 40 speculative), 150 file-backed (the 40
@@ -418,7 +447,7 @@ class RefusalTest(unittest.TestCase):
             throttled_count=50, compressor_page_count=200,
         )
         self.assertEqual(gate_macos.free_share(stats, 1000), 24)
-        self.assertIn("below 25%", self.decide(2, 1, gate_macos.free_share(stats, 1000)) or "")
+        self.assertEqual(self.decide(2, 1, gate_macos.free_share(stats, 1000)), "free")
         self.assertIsNone(gate_macos.free_share(stats, None))
 
     def test_tuning_variables_must_be_finite(self):
@@ -481,7 +510,8 @@ class ClaimTest(GateCase):
         del self.env["AGENT_GATE_MAX_CLAIM"]
 
     def test_a_larger_claim_runs_with_the_cap_and_its_runners_follow(self):
-        for args, granted, told in ((("-c", 4), "2", True), (("-c", 9), "2", True), ((), "2", False),
+        # A default claim reserves 2 and, alone, its runners get every CPU.
+        for args, granted, told in ((("-c", 4), "2", True), (("-c", 9), "2", True), ((), "4", False),
                                     (("-c", 1), "1", False)):
             with self.subTest(args=args):
                 result = self.gate(*args, "--", PY, "-c", self.PROBE)
@@ -508,6 +538,64 @@ class ClaimTest(GateCase):
         for name, proc in (("first", first), ("second", second)):
             self.release(name)
             self.assertEqual(self.finish(proc).code, 0)
+
+
+class FanOutTest(GateCase):
+    """A default claim's runners get the CPUs no other run's runners use; an explicit -c keeps its size."""
+
+    PROBE = "import os; print(os.environ['AGENT_GATE_CPUS'], os.environ['VITEST_MAX_WORKERS'])"
+
+    def workers(self, *args: object) -> List[str]:
+        result = self.gate(*args, "--", PY, "-c", self.PROBE)
+        self.assertEqual(result.code, 0, result.err)
+        return result.out.split()
+
+    def test_a_lone_default_run_uses_the_whole_machine(self):
+        self.assertEqual(self.workers(), ["4", "4"])
+        self.assertEqual(self.workers("-c", 2), ["2", "2"])
+        self.assertEqual(self.events("released")[0]["workers"], 4)
+
+    def test_beside_other_runs_a_default_run_gets_what_they_leave(self):
+        self.env["AGENT_GATE_TOKENS"] = "6"
+        small = self.holding("small", 1)
+        self.assertEqual(self.workers(), ["5", "5"])
+        wide = self.start("--", *self.held("wide"), name="wide")
+        self.command_pid("wide")
+        self.assertEqual(self.workers(), ["2", "2"], "never below the claim it reserves")
+        self.end(small, wide)
+
+    def test_without_memory_to_spare_a_default_run_keeps_its_claim(self):
+        self.set_memory("1 10")
+        self.assertEqual(self.workers(), ["2", "2"])
+
+    def test_a_nested_gate_and_inside_get_the_runs_workers(self):
+        script = self.gate_script(
+            """
+            subprocess.run(gate + ["inside", "-c", "3"], check=True)
+            subprocess.run(gate + ["--", sys.executable, "-c", "import os; print(os.environ['AGENT_GATE_CPUS'])"],
+                           check=True)
+            """
+        )
+        result = self.gate("--", PY, "-c", script)
+        self.assertEqual(result.code, 0, result.err)
+        self.assertEqual(result.out.split(), ["4"])
+
+
+class SwapTest(GateCase):
+    """The swap-out rate is shared by every gate on the host, so a gate that just started need not measure it."""
+
+    def test_a_new_gate_beside_a_running_one_starts_without_measuring(self):
+        env = {key: value for key, value in self.env.items() if key != "AGENT_GATE_MEMORY_FILE"}
+        # The real kernel signal, with limits no host reaches: only an unmeasured rate could hold it.
+        env.update(AGENT_GATE_MIN_FREE_PCT="0", AGENT_GATE_MAX_SWAPOUT_MBPS="1000000")
+        blocker = self.start("-c", 1, "--", *self.held("blocker"), env=env, name="blocker")
+        self.command_pid("blocker")
+        time.sleep(1.2)
+        result = self.gate("--no-wait", "-c", 2, "--", PY, "-c", "pass", env=env)
+        self.assertEqual(result.code, 0, result.err)
+        self.assertIsNotNone(self.events("admitted")[-1]["swapout"])
+        self.release("blocker")
+        self.assertEqual(self.finish(blocker).code, 0)
 
 
 class QueueTest(GateCase):
@@ -721,14 +809,16 @@ class MemoryTest(GateCase):
         self.assertEqual(result.code, 0, result.err)
         self.end(blocker)
 
-    def test_low_free_memory_holds_a_second_run(self):
+    def test_low_free_memory_holds_a_second_run_but_not_a_one_token_one(self):
         self.set_memory("2 10")
         blocker = self.holding("blocker", 1)
-        result = self.gate("--no-wait", "-c", 1, "--", PY, "-c", "pass")
+        result = self.gate("--no-wait", "-c", 2, "--", PY, "-c", "pass")
         self.assertEqual(result.code, agent_gate.NOT_ADMITTED_EXIT)
         self.assertIn("10% memory free", result.err)
+        result = self.gate("--no-wait", "-c", 1, "--", PY, "-c", "pass")
+        self.assertEqual(result.code, 0, result.err)
         self.set_memory("2 30")
-        self.assertEqual(self.gate("--no-wait", "-c", 1, "--", PY, "-c", "pass").code, 0)
+        self.assertEqual(self.gate("--no-wait", "-c", 2, "--", PY, "-c", "pass").code, 0)
         self.end(blocker)
 
     def test_swapping_holds_a_second_run_until_it_stops(self):
@@ -746,13 +836,13 @@ class MemoryTest(GateCase):
         env = dict(self.env, AGENT_GATE_RAMP_SECONDS="3")
         first = self.start("-c", 1, "--", *self.held("first"), env=env, name="first")
         self.command_pid("first")
-        result = self.gate("--no-wait", "-c", 1, "--", PY, "-c", "pass", env=env)
+        result = self.gate("--no-wait", "-c", 2, "--", PY, "-c", "pass", env=env)
         self.assertEqual(result.code, 0, f"80% free: no ramp. {result.err}")
         self.set_memory("1 30")
-        result = self.gate("--no-wait", "-c", 1, "--", PY, "-c", "pass", env=env)
+        result = self.gate("--no-wait", "-c", 2, "--", PY, "-c", "pass", env=env)
         self.assertEqual(result.code, agent_gate.NOT_ADMITTED_EXIT, result.err)
         self.assertIn("still starting", result.err)
-        result = self.gate("--wait", 10, "-c", 1, "--", PY, "-c", "pass", env=env)
+        result = self.gate("--wait", 10, "-c", 2, "--", PY, "-c", "pass", env=env)
         self.assertEqual(result.code, 0, result.err)
         first_at, plenty, thin = (event["admitted"] for event in self.events("admitted"))
         self.assertLess(plenty - first_at, 3, "admitted without the ramp")
@@ -769,15 +859,16 @@ SLOW_GATE = textwrap.dedent(
     sys.path.insert(0, sys.argv.pop(1))
     import agent_gate
 
-    read = agent_gate.Snapshot.__init__
+    read = agent_gate.read_snapshot
 
-    def slow(self, *args, **kwargs):
-        read(self, *args, **kwargs)
+    def slow(*args, **kwargs):
+        snapshot = read(*args, **kwargs)
         with open(os.environ["SLOW_GATE_MARKS"], "a") as marks:
-            marks.write(f"{self.used:g}\\n")
+            marks.write(f"{snapshot.used:g}\\n")
         time.sleep(float(os.environ["SLOW_GATE_SECONDS"]))
+        return snapshot
 
-    agent_gate.Snapshot.__init__ = slow
+    agent_gate.read_snapshot = slow
     raise SystemExit(agent_gate.main())
     """
 )
@@ -961,40 +1052,6 @@ class BackfillTest(GateCase):
         self.end(passer)
         self.wait_for(lambda: self.started("head"), "the head to start once the passer ends")
         self.end(head, big)
-
-    def test_an_older_gates_records_are_honoured(self):
-        self.env["AGENT_GATE_SMALL_HEADROOM"] = "2"
-        big = self.holding("big", 5)
-        settings = self.settings()
-        # The older gate: alive, and no ancestor of the gates under test, which would run nested in its run.
-        older_gate = self.sleeper()
-        self.wait_for(lambda: gate_macos.process_info(older_gate.pid), "the older gate to start")
-        me = {"pid": older_gate.pid, "start": gate_macos.process_info(older_gate.pid)[1], "cwd": str(self.tmp),
-              "docker_gib": 0}
-        # Its run and its request queued next, whose locks this process holds: neither record names a protocol.
-        run = agent_gate.publish_locked(settings.jobs, "00000000000001d1.lock", {
-            **me, "id": "00000000000001d1", "k": 3, "asked": 3, "label": "older run", "admitted": time.time()})
-        self.addCleanup(os.close, run)
-        older = {**me, "id": "00000000000001d2", "k": 5, "asked": 5, "label": "older request", "queued": time.time()}
-        name = f"{100:012d}-00000000000001d2.lock"
-        waiter = agent_gate.publish_locked(settings.waiters, name, dict(older, ticket=100))
-        self.assertEqual(self.status()["used"], 8)
-        result = self.gate("--no-wait", "-c", 1, "--", PY, "-c", "pass")
-        self.assertEqual(result.code, agent_gate.NOT_ADMITTED_EXIT, result.err)
-        self.assertIn("older gate", result.err)
-        # The same request from this version's gate may be passed.
-        os.unlink(settings.waiters / name)
-        os.close(waiter)
-        name = f"{200:012d}-00000000000001d2.lock"
-        waiter = agent_gate.publish_locked(settings.waiters, name, dict(older, ticket=200, protocol=agent_gate.PROTOCOL))
-        self.addCleanup(os.close, waiter)
-        self.addCleanup(os.unlink, settings.waiters / name)
-        result = self.gate("--no-wait", "-c", 1, "--", PY, "-c", "pass")
-        self.assertEqual(result.code, 0, result.err)
-        self.assertTrue(self.events("admitted")[-1]["backfilled"])
-        result = self.gate("--no-wait", "-c", 3, "--", PY, "-c", "pass")
-        self.assertIn("8 of 10 tokens in use, 3 needed", result.err, "the older run's tokens count")
-        self.end(big)
 
 
 class NestingTest(GateCase):

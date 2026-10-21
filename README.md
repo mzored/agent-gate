@@ -13,7 +13,9 @@ cd agent-gate
 ./bin/agent-gate status
 ```
 
-`-c` is the number of CPU tokens the job asks for. The default is 2. One job can claim at most half the machine's logical CPUs, so another job can run beside it. The gate also lowers a running command's CPU priority. Your command keeps its own exit code.
+The machine has one CPU token per logical CPU. A job reserves 2 tokens by default, so other jobs fit beside it, and its test runner may use every CPU that no other job's runners use: a job alone on an idle Mac runs as fast as it would without the gate. The gate sets `VITEST_MAX_WORKERS` and `PYTEST_XDIST_AUTO_NUM_WORKERS` (for `pytest -n auto`) to that number, and exports it as `AGENT_GATE_CPUS` for other runners. `-c K` reserves K tokens and limits the runners to K workers. One job can reserve at most half the logical CPUs.
+
+While other jobs run, a job that reserves more than one token also waits for free memory. A 1-token job waits only while the Mac is actually swapping or memory pressure is critical. The gate also lowers a running command's CPU priority. Your command keeps its own exit code.
 
 Use `./bin/agent-gate --help` for the other options, including wait limits, a timeout, and Docker VM memory claims. `./bin/agent-gate usage` compares past claims with measured CPU use.
 

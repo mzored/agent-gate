@@ -525,7 +525,8 @@ class DevshimTest(unittest.TestCase):
     def test_the_gate_runs_the_real_tool_with_its_budget(self):
         result = self.fixture.run(["npm", "test"], explain=False)
         self.assertEqual(result.returncode, 7, result.stderr)
-        self.assertEqual(result.stdout.strip(), "npm AGENT_GATE_CPUS=2")
+        # Alone on the fixture's 4 tokens, a default claim gets every CPU.
+        self.assertEqual(result.stdout.strip(), "npm AGENT_GATE_CPUS=4")
         result = self.fixture.run(["npm", "run", "lint"], explain=False)
         self.assertEqual(result.stdout.strip(), "npm AGENT_GATE_CPUS=none")
 
