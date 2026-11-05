@@ -8,14 +8,18 @@ import json
 import math
 import os
 from pathlib import Path
+import plistlib
+import re
 import signal
 import subprocess
 import sys
 import time
-from typing import Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Tuple
 
 RUN_ENV = "AGENT_GATE_RUN"
-# Tests can supply a file with pressure, free-memory share and swap-out rate.
+# Tests can supply a file whose first line holds pressure, free-memory share and swap-out rate.
+# It then stands in for the booted simulators too: each further line `simulator UDID BOOTED NAME`
+# names one, BOOTED in epoch seconds, and no other counts.
 MEMORY_FILE_ENV = "AGENT_GATE_MEMORY_FILE"
 # The swap-out rate uses readings taken over this window.
 SWAP_MIN_SECONDS = 1.0
@@ -88,12 +92,8 @@ _proc_listallpids.argtypes = [ctypes.c_void_p, ctypes.c_int]
 _proc_listallpids.restype = ctypes.c_int
 
 
-def process_info(pid: object) -> Optional[Tuple[int, int]]:
-    """(parent pid, start second) of a live process of this user; None when gone or a zombie.
-
-    Other users' processes are unreadable and also yield None; every process the
-    gate tracks belongs to this user.
-    """
+def _bsd_info(pid: object) -> Optional[_BsdInfo]:
+    """The kernel's record of a live process of this user; None when gone, a zombie or unreadable."""
     try:
         pid = int(pid)  # type: ignore[arg-type]
     except (TypeError, ValueError):
@@ -103,7 +103,167 @@ def process_info(pid: object) -> Optional[Tuple[int, int]]:
     info = _BsdInfo()
     if _proc_pidinfo(pid, _PROC_PIDTBSDINFO, 0, ctypes.byref(info), ctypes.sizeof(info)) != ctypes.sizeof(info):
         return None
-    return None if info.pbi_status == _SZOMB else (int(info.pbi_ppid), int(info.pbi_start_tvsec))
+    return None if info.pbi_status == _SZOMB else info
+
+
+def process_info(pid: object) -> Optional[Tuple[int, int]]:
+    """(parent pid, start second) of a live process of this user; None when gone or a zombie.
+
+    Other users' processes are unreadable and also yield None; every process the
+    gate tracks belongs to this user.
+    """
+    info = _bsd_info(pid)
+    return None if info is None else (int(info.pbi_ppid), int(info.pbi_start_tvsec))
+
+
+def process_name(pid: object) -> str:
+    """A live process's command name (at most 16 characters); "" when gone or unreadable."""
+    info = _bsd_info(pid)
+    return "" if info is None else info.pbi_comm.decode(errors="replace")
+
+
+class Process(NamedTuple):
+    """One process of this user, as the janitor sees it."""
+
+    pid: int
+    ppid: int
+    pgid: int
+    sid: int
+    start: int
+    name: str
+    argv: Tuple[str, ...]
+    #: The AGENT_GATE_RUN tag in its environment: the gated run it belongs to; "" when none.
+    run: str = ""
+
+
+def process_table() -> Optional[List[Process]]:
+    """Every live process of this user, with its arguments where readable; None when the table is unreadable."""
+    pids = all_pids()
+    if pids is None:
+        return None
+    buffer = _args_buffer()
+    table = []
+    uid = os.getuid()
+    for pid in pids:
+        info = _bsd_info(pid)
+        if info is None or info.pbi_uid != uid:
+            continue
+        try:
+            sid = os.getsid(pid)
+        except OSError:
+            continue
+        args = _procargs(pid, buffer)
+        argv, environment = args if args else ([], [])
+        tag = f"{RUN_ENV}="
+        run = next((item[len(tag):] for item in environment if item.startswith(tag)), "")
+        table.append(Process(pid, int(info.pbi_ppid), int(info.pbi_pgid), sid, int(info.pbi_start_tvsec),
+                             info.pbi_comm.decode(errors="replace"), tuple(argv), run))
+    return table
+
+
+class _VinfoStat(ctypes.Structure):
+    """struct vinfo_stat from <sys/proc_info.h>."""
+
+    _fields_ = [("vst_dev", ctypes.c_uint32), ("vst_mode", ctypes.c_uint16), ("vst_nlink", ctypes.c_uint16),
+                ("vst_ino", ctypes.c_uint64), ("vst_uid", ctypes.c_uint32), ("vst_gid", ctypes.c_uint32),
+                ("vst_times", ctypes.c_int64 * 8), ("vst_size", ctypes.c_int64), ("vst_blocks", ctypes.c_int64),
+                ("vst_blksize", ctypes.c_int32), ("vst_flags", ctypes.c_uint32), ("vst_gen", ctypes.c_uint32),
+                ("vst_rdev", ctypes.c_uint32), ("vst_qspare", ctypes.c_int64 * 2)]
+
+
+class _VnodeInfoPath(ctypes.Structure):
+    """struct vnode_info_path."""
+
+    _fields_ = [("vi_stat", _VinfoStat), ("vi_type", ctypes.c_int), ("vi_pad", ctypes.c_int),
+                ("vi_fsid", ctypes.c_int32 * 2), ("vip_path", ctypes.c_char * 1024)]
+
+
+class _VnodePathInfo(ctypes.Structure):
+    """struct proc_vnodepathinfo: the working and root directories."""
+
+    _fields_ = [("pvi_cdir", _VnodeInfoPath), ("pvi_rdir", _VnodeInfoPath)]
+
+
+class _PipeFdInfo(ctypes.Structure):
+    """struct pipe_fdinfo: struct proc_fileinfo, then struct pipe_info."""
+
+    _fields_ = [("fi_openflags", ctypes.c_uint32), ("fi_status", ctypes.c_uint32), ("fi_offset", ctypes.c_int64),
+                ("fi_type", ctypes.c_int32), ("fi_guardflags", ctypes.c_uint32), ("pipe_stat", _VinfoStat),
+                ("pipe_handle", ctypes.c_uint64), ("pipe_peerhandle", ctypes.c_uint64), ("pipe_status", ctypes.c_int),
+                ("rfu_1", ctypes.c_int)]
+
+
+_PROC_PIDLISTFDS = 1
+_PROC_PIDVNODEPATHINFO = 9
+_PROC_PIDFDSOCKETINFO = 3
+_PROC_PIDFDPIPEINFO = 6
+_PROX_FDTYPE_SOCKET = 2
+# Offsets into struct socket_fdinfo, which ctypes need not spell out whole.
+_SOCKET_FDINFO_SIZE = 792
+_SOI_FAMILY, _SOI_OPTIONS, _SOI_STATE, _SOI_KIND, _INSI_LPORT, _TCPSI_STATE = 184, 188, 192, 256, 268, 344
+_AF_UNIX, _SO_ACCEPTCONN, _SS_ISCONNECTED, _SOCKINFO_TCP, _TSI_S_ESTABLISHED = 1, 0x2, 0x2, 2, 4
+_proc_pidfdinfo = _LIBC.proc_pidfdinfo
+_proc_pidfdinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+_proc_pidfdinfo.restype = ctypes.c_int
+
+
+def working_directory(pid: int) -> Optional[Tuple[str, int]]:
+    """The path and inode of a live process's working directory; None when unreadable.
+
+    The kernel keeps both for a directory deleted under the process: whether it is gone is what
+    stat(2) of the path says now.
+    """
+    info = _VnodePathInfo()
+    if _proc_pidinfo(pid, _PROC_PIDVNODEPATHINFO, 0, ctypes.byref(info), ctypes.sizeof(info)) != ctypes.sizeof(info):
+        return None
+    path = info.pvi_cdir.vip_path
+    return (os.fsdecode(path), int(info.pvi_cdir.vi_stat.vst_ino)) if path else None
+
+
+def stdout_unread(pid: int) -> bool:
+    """Whether a process's standard output is a pipe whose read end no process holds."""
+    info = _PipeFdInfo()
+    if _proc_pidfdinfo(pid, 1, _PROC_PIDFDPIPEINFO, ctypes.byref(info), ctypes.sizeof(info)) != ctypes.sizeof(info):
+        return False
+    return info.pipe_peerhandle == 0
+
+
+class Socket(NamedTuple):
+    unix: bool
+    listening: bool
+    #: Its local TCP port; 0 for other sockets.
+    port: int
+    #: A TCP connection that is established.
+    established: bool
+
+
+def sockets(pid: int) -> Optional[List[Socket]]:
+    """A live process's sockets; None when its descriptors are unreadable."""
+    count = 1024
+    while True:
+        fds = (ctypes.c_int32 * (2 * count))()
+        size = _proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, fds, ctypes.sizeof(fds))
+        if size <= 0:
+            return None
+        if size < ctypes.sizeof(fds):
+            break
+        count *= 4
+    buffer = ctypes.create_string_buffer(_SOCKET_FDINFO_SIZE)
+    found = []
+    for index in range(size // 8):
+        if fds[2 * index + 1] != _PROX_FDTYPE_SOCKET:
+            continue
+        if _proc_pidfdinfo(pid, fds[2 * index], _PROC_PIDFDSOCKETINFO, buffer, _SOCKET_FDINFO_SIZE) < _SOCKET_FDINFO_SIZE:
+            continue  # closed meanwhile
+
+        def field(offset: int, size: int = 4) -> int:
+            return int.from_bytes(buffer.raw[offset:offset + size], sys.byteorder)
+
+        tcp = field(_SOI_KIND) == _SOCKINFO_TCP
+        port = int.from_bytes(field(_INSI_LPORT).to_bytes(4, sys.byteorder)[:2], "big") if tcp else 0
+        found.append(Socket(field(_SOI_FAMILY) == _AF_UNIX, bool(field(_SOI_OPTIONS, 2) & _SO_ACCEPTCONN), port,
+                            tcp and field(_TCPSI_STATE) == _TSI_S_ESTABLISHED))
+    return found
 
 
 def all_pids() -> Optional[List[int]]:
@@ -419,7 +579,7 @@ def memory_signal(environ: Mapping[str, str],
     override = environ.get(MEMORY_FILE_ENV)
     if override:
         try:
-            words = Path(override).read_text().split()[:3]
+            words = (Path(override).read_text().splitlines() or [""])[0].split()[:3]
             pressure, free = (None if word == "-" else int(word) for word in words[:2])
             return pressure, free, float(words[2]) if len(words) > 2 else 0.0
         except (OSError, ValueError):
@@ -430,6 +590,60 @@ def memory_signal(environ: Mapping[str, str],
         return sysctl_int("kern.memorystatus_vm_pressure_level"), None, None
     return (sysctl_int("kern.memorystatus_vm_pressure_level"), free_share(stats, _MEMORY_PAGES),
             swapout_rate(stats.swapouts * _PAGE_BYTES, samples))
+
+
+def memory_gib() -> Optional[float]:
+    """Usable memory in GiB, the denominator of the free share; None when unreadable."""
+    return _MEMORY_PAGES * _PAGE_BYTES / 2**30 if _MEMORY_PAGES else None
+
+
+class Simulator(NamedTuple):
+    """A booted simulator: its device, when it booted (its launchd_sim's start second) and that process."""
+
+    udid: str
+    name: str
+    booted: float
+    pid: int
+
+
+#: launchd_sim's one argument names the device's bootstrap plist in its data directory.
+_BOOTSTRAP_RE = re.compile(r"^(.*/([0-9A-Fa-f-]{36}))/data/var/run/launchd_bootstrap\.plist$")
+
+
+def booted_simulators(environ: Mapping[str, str]) -> List[Simulator]:
+    """The booted simulators, read from the process table: each runs one launchd_sim of this user.
+
+    No simctl runs, so a waiter may read them on every poll. The host-signal
+    override (MEMORY_FILE_ENV) stands in for them; an unreadable table reads as none.
+    """
+    override = environ.get(MEMORY_FILE_ENV)
+    if override:
+        found = []
+        with contextlib.suppress(OSError):
+            for line in Path(override).read_text().splitlines()[1:]:
+                words = line.split(None, 3)
+                if len(words) >= 3 and words[0] == "simulator":
+                    with contextlib.suppress(ValueError):
+                        found.append(Simulator(words[1], words[3] if len(words) > 3 else words[1], float(words[2]), 0))
+        return found
+    pids = all_pids() or []
+    buffer: Optional["ctypes.Array[ctypes.c_char]"] = None
+    found = []
+    for pid in pids:
+        info = _bsd_info(pid)
+        if info is None or info.pbi_comm != b"launchd_sim":
+            continue
+        buffer = buffer or _args_buffer()
+        args = _procargs(pid, buffer)
+        match = _BOOTSTRAP_RE.match(args[0][-1]) if args and args[0] else None
+        if match is None:
+            continue
+        name = match.group(2)
+        with contextlib.suppress(OSError, ValueError, plistlib.InvalidFileException):
+            with open(Path(match.group(1)) / "device.plist", "rb") as handle:
+                name = str(plistlib.load(handle).get("name") or name)
+        found.append(Simulator(match.group(2).upper(), name, float(info.pbi_start_tvsec), pid))
+    return sorted(found, key=lambda simulator: simulator.booted)
 
 
 #: (busy counters, idle counters, the modulus they wrap at)

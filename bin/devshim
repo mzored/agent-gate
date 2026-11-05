@@ -29,6 +29,8 @@
 #              itself and its test frameworks refuse unbounded runs, so the shim
 #              adds nothing. Its bundlers still take the gate.
 #   gate       a heavy verb elsewhere: agent-gate queues it for its default claim.
+#              Docker builds also claim Docker VM memory; Xcode tests and simulator
+#              boots claim the simulators they boot (see "Docker and Apple tools").
 #   direct     everything else, dev servers and watchers included. No QoS class:
 #              background pins a run to the efficiency cores.
 #
@@ -53,15 +55,229 @@ fi
 
 explain() {
   if [ -n "${DEVSHIM_EXPLAIN:-}" ]; then
-    echo "devshim: tool=$self real=$real sub=${sub:-<none>} watching=${watching:-0} heavy=${heavy:-0} root=${root:-<none>} decision=$1"
+    claims=$(printf '%s' "${gate_args:-none}" | tr ' ' ,)
+    echo "devshim: tool=$self real=$real sub=${sub:-<none>} watching=${watching:-0} heavy=${heavy:-0} root=${root:-<none>} claims=$claims decision=$1"
     exit 0
   fi
+}
+
+# Runs the command line "$@" through the gate with the extra claims in
+# $gate_args (words without spaces), labelled with the tool and its verb.
+gated() {
+  gate="$shared_bin/agent-gate"
+  if [ -x "$gate" ]; then
+    explain gate
+    # A Claude Code Bash call that outlives its timeout is backgrounded, not
+    # killed, and Codex's unified exec keeps the process running after it
+    # yields, so waiting in the queue never strands an agent.
+    # shellcheck disable=SC2086
+    exec "$gate" -l "$self${sub:+ $sub}" $gate_args -- "$@"
+  fi
+  echo "devshim: agent-gate is unavailable; nothing ran." >&2
+  exit 78
 }
 
 if [ -n "${DEVSHIM_BYPASS:-}" ]; then
   explain bypass
   exec "$real" "$@"
 fi
+
+# ------------------------------------------------- Docker and Apple tools
+# Their work outlives the host's view of a test runner: a Docker build fills
+# Docker's VM, an Xcode build uses every core and a simulator holds a core and
+# about 1.5 GB for as long as it stays booted. They are classified here, by
+# their own grammar, and take the gate wherever they run: a repository's
+# `.agent-admission` covers its test entry points, not these.
+#   docker      build, image build, builder build, buildx build|b|bake and
+#               compose build claim memory in Docker's VM
+#               (AGENT_GATE_DOCKER_BUILD_GIB, default 1.5). `compose up --build`
+#               is a long-lived stack and runs directly.
+#   xcodebuild  build, test and archive actions, and a bare call (a build).
+#               Its fan-out follows the gate's grant through -jobs, unless the
+#               caller set one; test actions claim the simulators they boot.
+#   xcrun       `simctl boot` and `simctl bootstatus -b` claim one simulator;
+#               `xcrun xcodebuild` is xcodebuild; everything else runs at once.
+
+# Sets heavy, sub and gate_args for an xcodebuild command line; with xcrun, its
+# arguments start after the word `xcodebuild`.
+xcodebuild_route() {
+  xb_started=1
+  [ "$self" = xcrun ] && xb_started=0
+  xb_skip=0
+  xb_info=0
+  xb_jobs=0
+  xb_test=0
+  xb_destinations=0
+  xb_simulators=0
+  xb_workers=""
+  xb_cap=0
+  xb_value_of=""
+  for a in "$@"; do
+    if [ "$xb_started" = 0 ]; then
+      [ "$a" = xcodebuild ] && xb_started=1
+      continue
+    fi
+    if [ "$xb_skip" = 1 ]; then
+      xb_skip=0
+      if [ "$xb_value_of" = -destination ]; then
+        xb_destinations=$((xb_destinations + 1))
+        # A simulator by platform, or by id alone (devices are named by platform too).
+        case "$a" in
+          *Simulator*) xb_simulators=$((xb_simulators + 1)) ;;
+          *platform=*) ;;
+          *id=*) xb_simulators=$((xb_simulators + 1)) ;;
+        esac
+      fi
+      # Parallel testing boots a clone of the simulator per test runner.
+      case "$xb_value_of=$a" in
+        -parallel-testing-worker-count=*|-maximum-parallel-testing-workers=*) xb_workers=$a ;;
+        -parallel-testing-enabled=NO) xb_workers=1 ;;
+      esac
+      continue
+    fi
+    case "$a" in
+      # Flags, from `xcodebuild -help`; every other option takes a value.
+      -usage|-help|-license|-checkFirstLaunchStatus|-runFirstLaunch|-list|-version|\
+      -showsdks|-showdestinations|-showTestPlans|-showBuildSettings|-showBuildSettingsForIndex|\
+      -exportArchive|-exportNotarizedApp|-exportLocalizations|-importLocalizations|\
+      -resolvePackageDependencies|-enumerate-tests|-create-xcframework|-downloadAllPlatforms|\
+      -prepareDeviceSupport)
+        xb_info=1 ;;
+      -verbose|-alltargets|-parallelizeTargets|-quiet|-hideShellScriptEnvironment|\
+      -skipUnavailableActions|-includeScreenshots|-mergeImport|-retry-tests-on-failure|\
+      -run-tests-until-failure|-disableAutomaticPackageResolution|-onlyUsePackageVersionsFromResolvedFile|\
+      -skipPackageUpdates|-disablePackageRepositoryCache|-skipPackagePluginValidation|-skipMacroValidation|\
+      -skipPackageSignatureValidation|-json|-allowProvisioningUpdates|-allowProvisioningDeviceRegistration|\
+      -showBuildTimingSummary|-checkForNewerComponents|-disable-concurrent-destination-testing|\
+      -only-testing:*|-skip-testing:*|-*=*)
+        ;;
+      -jobs) xb_jobs=1; xb_skip=1; xb_value_of=$a ;;
+      -download*|-import*|-export*|-find-*|-convert-project|-deleteComponent|-showComponent)
+        xb_info=1; xb_skip=1; xb_value_of=$a ;;
+      -*) xb_skip=1; xb_value_of=$a ;;
+      *=*) ;;
+      test|test-without-building) xb_test=1; sub=${sub:-$a} ;;
+      build|build-for-testing|archive|analyze|docbuild|install|installsrc) sub=${sub:-$a} ;;
+      clean) ;;
+      *) ;;
+    esac
+  done
+  heavy=0
+  # A bare call builds; `clean` alone does not.
+  if [ "$xb_info" = 0 ]; then
+    if [ -n "$sub" ]; then
+      heavy=1
+    else
+      heavy=1
+      for a in "$@"; do
+        [ "$a" = clean ] && heavy=0
+      done
+      [ "$heavy" = 1 ] && sub=build
+    fi
+  fi
+  gate_args=""
+  if [ "$xb_test" = 1 ]; then
+    [ "$xb_destinations" = 0 ] && xb_simulators=1
+    case "$xb_workers" in
+      "") xb_cap=1 ;;
+      *[!0-9]*) ;;
+      *) xb_simulators=$((xb_simulators * xb_workers)) ;;
+    esac
+    [ "$xb_simulators" = 0 ] && xb_cap=0
+    [ "$xb_simulators" = 0 ] || gate_args="--simulators $xb_simulators"
+  fi
+}
+
+case "$self" in
+  docker)
+    # The verb, past the options of docker, buildx and compose that take a value.
+    sub=""
+    docker_skip=0
+    for a in "$@"; do
+      if [ "$docker_skip" = 1 ]; then docker_skip=0; continue; fi
+      case "$a" in
+        --config|-c|--context|-H|--host|-l|--log-level|--tlscacert|--tlscert|--tlskey|--builder|\
+        -f|--file|-p|--project-name|--project-directory|--env-file|--profile|--progress|--ansi|--parallel)
+          docker_skip=1; continue ;;
+        -*) continue ;;
+      esac
+      sub="${sub:+$sub }$a"
+      case "$sub" in image|builder|buildx|compose) continue ;; esac
+      break
+    done
+    heavy=0
+    case "$sub" in
+      build|"image build"|"builder build"|"buildx build"|"buildx b"|"buildx bake"|"compose build") heavy=1 ;;
+    esac
+    for a in "$@"; do
+      case "$a" in --help|-h|--print|--dry-run) heavy=0 ;; esac
+    done
+    if [ "$heavy" = 1 ]; then
+      gate_args="--docker-gib ${AGENT_GATE_DOCKER_BUILD_GIB:-1.5}"
+      gated "$real" "$@"
+    fi
+    explain direct
+    exec "$real" "$@" ;;
+  xcodebuild|xcrun)
+    sub=""
+    heavy=0
+    if [ "$self" = xcrun ]; then
+      # The tool xcrun runs, past its options; finding paths runs nothing.
+      xcrun_skip=0
+      xcrun_tool=""
+      for a in "$@"; do
+        if [ "$xcrun_skip" = 1 ]; then xcrun_skip=0; continue; fi
+        case "$a" in
+          -sdk|--sdk|-toolchain|--toolchain) xcrun_skip=1 ;;
+          -f|--find|--show-*|--version|-h|--help) break ;;
+          -*) ;;
+          *) xcrun_tool=$a; break ;;
+        esac
+      done
+      case "$xcrun_tool" in
+        xcodebuild) xcodebuild_route "$@" ;;
+        simctl)
+          simctl_seen=0
+          simctl_skip=0
+          simctl_boot=0
+          for a in "$@"; do
+            if [ "$simctl_seen" = 0 ]; then
+              [ "$a" = simctl ] && simctl_seen=1
+              continue
+            fi
+            if [ "$simctl_skip" = 1 ]; then simctl_skip=0; continue; fi
+            if [ -z "$sub" ]; then
+              case "$a" in
+                --set|--profiles) simctl_skip=1 ;;
+                -*) ;;
+                *) sub="simctl $a" ;;
+              esac
+              continue
+            fi
+            [ "$a" = -b ] && simctl_boot=1
+          done
+          case "$sub" in
+            "simctl boot") heavy=1 ;;
+            "simctl bootstatus") heavy=$simctl_boot ;;
+          esac
+          [ "$heavy" = 0 ] || gate_args="-c 1 --simulators 1" ;;
+      esac
+    else
+      xcodebuild_route "$@"
+    fi
+    if [ "$heavy" = 1 ]; then
+      # Tests on simulators the caller set no runner count for boot one simulator per
+      # destination, as many as they claim.
+      [ "${xb_cap:-0}" = 1 ] && set -- "$@" -maximum-parallel-testing-workers 1
+      if [ "${xb_jobs:-1}" = 0 ]; then
+        # xcodebuild reads no worker variable: its operations follow the grant.
+        gated /bin/sh -c 'exec "$@" -jobs "$AGENT_GATE_CPUS"' sh "$real" "$@"
+      fi
+      gated "$real" "$@"
+    fi
+    explain direct
+    exec "$real" "$@" ;;
+esac
 
 # Commands inside a gated run are classified too: agent-gate recognises its own
 # live ancestor and runs them in that budget without queueing again.
@@ -686,16 +902,7 @@ if [ "$heavy" -eq 1 ] && [ "$owned" = 1 ]; then
 fi
 
 if [ "$heavy" -eq 1 ]; then
-  gate="$shared_bin/agent-gate"
-  if [ -x "$gate" ]; then
-    explain gate
-    # A Claude Code Bash call that outlives its timeout is backgrounded, not
-    # killed, and Codex's unified exec keeps the process running after it
-    # yields, so waiting in the queue never strands an agent.
-    exec "$gate" -l "$self${sub:+ $sub}" -- "$real" "$@"
-  fi
-  echo "devshim: agent-gate is unavailable; nothing ran." >&2
-  exit 78
+  gated "$real" "$@"
 fi
 
 explain direct
