@@ -7,7 +7,8 @@ on an idle machine uses the whole machine while its reservation stays small enou
 Who starts:
 
 - Critical memory pressure holds every request.
-- A run starts at once when no other run holds tokens.
+- A run starts at once when no other run holds tokens. A booted simulator holds 1 token (one core)
+  for as long as it runs, as if it were a run.
 - Beside other runs, a claim must fit: the runs together hold at most T tokens, or T plus the
   headroom (AGENT_GATE_SMALL_HEADROOM) when the claim is 1 token.
 - Beside other runs, measured swap-out over AGENT_GATE_MAX_SWAPOUT_MBPS holds every request. A claim
@@ -15,6 +16,10 @@ Who starts:
   is within AGENT_GATE_RAMP_MARGIN_PCT of that minimum, until the previous admission is
   AGENT_GATE_RAMP_SECONDS old. A 1-token run is small, so only that evidence of harm holds it, not
   the prediction.
+- Memory a run claims (`--simulators`: about 1.5 GiB per simulator it boots) is predicted beside other
+  runs whatever its token claim: it waits while the free share, less what the claim and the pending
+  claims take of usable memory, would fall below AGENT_GATE_MIN_FREE_PCT. Claims of runs admitted and
+  simulators booted in the last minute are pending: the free share does not show them yet.
 - The queue is FIFO, but a later request may start first while no request ahead may start now, so a
   1-token run passes a larger one that memory holds. Once a request ahead has waited
   AGENT_GATE_BACKFILL_SECONDS, only a 1-token run into the headroom passes it, and only while runs
@@ -71,6 +76,10 @@ class Snapshot:
     swapout: Optional[float]
     #: Seconds since the last admission on this host.
     since_admit: float
+    #: Usable memory in GiB; None when unreadable.
+    total_gib: Optional[float] = None
+    #: GiB that recent admissions and simulator boots claimed and the free share does not show yet.
+    pending_gib: float = 0.0
 
     @property
     def used(self) -> float:
@@ -91,12 +100,21 @@ class Snapshot:
         """CPUs the live runs' runners may use together."""
         return sum(run_workers(job) for job in self.jobs)
 
+    def free_after(self, gib: float) -> Optional[float]:
+        """The free share once `gib` more and the pending claims show; None when unreadable."""
+        if self.free is None:
+            return None
+        if not self.total_gib:
+            return float(self.free)
+        return self.free - 100 * (gib + self.pending_gib) / self.total_gib
+
     def memory_text(self) -> str:
         if self.free is None:
             return "memory signal unavailable"
         level = "pressure unreadable" if self.pressure is None else PRESSURE_NAMES.get(self.pressure, self.pressure)
         swap = "" if self.swapout is None else f", swapping out {self.swapout:.1f} MiB/s"
-        return f"memory {level}, {self.free}% free{swap}"
+        pending = f", {self.pending_gib:.1f} GiB claimed and not shown yet" if self.pending_gib else ""
+        return f"memory {level}, {self.free}% free{pending}{swap}"
 
 
 @dataclass(frozen=True)
@@ -152,15 +170,17 @@ def queue_decision(ahead: Sequence[Mapping[str, object]], k: int, limits: Limits
         return _hold("aged", f"an earlier request has waited over {limits.backfill:g}s for its tokens; nothing "
                              f"passes it except a 1-token run into the headroom while runs outside it hold all "
                              f"{limits.tokens} tokens")
-    if snapshot is not None and any(decide(snapshot, number(w.get("k")), limits).starts for w in ahead):
+    if snapshot is not None and any(decide(snapshot, number(w.get("k")), limits, gib=number(w.get("mem_gib"))).starts
+                                    for w in ahead):
         return _hold("fits-first", "an earlier request that may start goes first")
     return None
 
 
-def memory_hold(snapshot: Snapshot, limits: Limits, small: bool) -> Optional[Decision]:
+def memory_hold(snapshot: Snapshot, limits: Limits, small: bool, gib: float = 0.0) -> Optional[Decision]:
     """Why memory has no room for more work beside the live runs; None when it has.
 
-    A small (1-token) addition is held only by measured harm, a larger one by the free-share prediction too.
+    A small (1-token) addition without a memory claim is held only by measured harm; a larger one, or one
+    that claims `gib`, by the free-share prediction too.
     """
     if snapshot.pressure is not None and snapshot.pressure >= CRITICAL:
         return _hold("critical", "memory pressure is critical")
@@ -168,10 +188,17 @@ def memory_hold(snapshot: Snapshot, limits: Limits, small: bool) -> Optional[Dec
         return _hold("unreadable", "memory signal unavailable, so one run at a time")
     if snapshot.swapout is not None and snapshot.swapout > limits.max_swapout:
         return _hold("swap", f"the host swaps out {snapshot.swapout:.1f} MiB/s, over {limits.max_swapout:g}")
+    if gib:
+        left = snapshot.free_after(gib)
+        if left is not None and left < limits.min_free:
+            return _hold("claim", f"its {gib:g} GiB would leave {max(left, 0):.0f}% memory free, below "
+                                  f"{limits.min_free:g}%")
     if small:
         return None
-    if snapshot.free < limits.min_free:
-        return _hold("free", f"{snapshot.free}% memory free, below {limits.min_free:g}%")
+    left = snapshot.free_after(0.0)
+    if left is not None and left < limits.min_free:
+        return _hold("free", f"{left:.0f}% memory free once recent claims show, below {limits.min_free:g}%"
+                     if snapshot.pending_gib else f"{snapshot.free}% memory free, below {limits.min_free:g}%")
     if snapshot.swapout is None:
         return _hold("measuring", "measuring whether the host swaps")
     return None
@@ -187,8 +214,9 @@ def fan_out(snapshot: Snapshot, k: int, grow: bool, limits: Limits) -> int:
 
 
 def decide(snapshot: Snapshot, k: int, limits: Limits, ahead: Sequence[Mapping[str, object]] = (),
-           now: float = 0.0, grow: bool = False) -> Decision:
-    """Whether a request claiming `k` may start now, `ahead` listing the live requests queued before it.
+           now: float = 0.0, grow: bool = False, gib: float = 0.0) -> Decision:
+    """Whether a request claiming `k` tokens and `gib` of memory may start now, `ahead` listing the live
+    requests queued before it.
 
     With `grow` (a default claim), a request that starts gets the idle CPUs as its fan-out.
     """
@@ -203,7 +231,7 @@ def decide(snapshot: Snapshot, k: int, limits: Limits, ahead: Sequence[Mapping[s
         if snapshot.used + k > limit(limits, k):
             extra = f" (+{limits.headroom} for 1-token runs)" if k == 1 and limits.headroom else ""
             return _hold("tokens", f"{snapshot.used:g} of {limits.tokens} tokens in use{extra}, {k} needed")
-        held = memory_hold(snapshot, limits, small=k == 1)
+        held = memory_hold(snapshot, limits, small=k == 1, gib=gib)
         if held is not None:
             return held
         ramp = k != 1 and limits.ramp > 0 and thin(limits, snapshot.free)

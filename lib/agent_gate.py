@@ -17,9 +17,17 @@ in the Docker VM (--docker-gib). It first waits in a queue of its own until the
 VM has that much available beyond what earlier Docker runs reserved, then joins
 the token queue, so waiting for the VM holds no tokens and delays no other run.
 
-    agent-gate [-c K] [-l LABEL] [--docker-gib G [--docker-frees PROJECT]]
+A command that boots simulators declares how many (--simulators N). Each booted
+simulator holds one token and about AGENT_GATE_SIMULATOR_GIB of memory for as
+long as it runs, whoever booted it, so the claim is the memory it will take: the
+run waits until the free share has room for it. A run during which a simulator
+boots, by its command or a nested run, records the processes it ran for as the
+simulator's owners, for `agent-gate janitor`.
+
+    agent-gate [-c K] [-l LABEL] [--docker-gib G [--docker-frees PROJECT]] [--simulators N]
                [--wait SECS | --no-wait] [--timeout SECS] -- CMD...
     agent-gate status [--json]
+    agent-gate janitor [--apply] [--json] [--simulator-hours H]   leftovers nobody owns; see gate_janitor
     agent-gate usage [--hours H] [--match TEXT] [--json]   claimed tokens against measured CPUs
     agent-gate inside [-c K] exit 0 inside a live gated run or while the gate is off (78 if its budget is below K, capped as a claim), 1 outside
     agent-gate off | on      stop or resume admission control host-wide
@@ -67,8 +75,8 @@ import time
 from typing import Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from gate_macos import (
-    GRACE_SECONDS, RUN_ENV, Processes, ancestors, host_busy, host_cpu_ticks,
-    lock_holders, memory_signal, own_start, same_process, stop_processes,
+    GRACE_SECONDS, RUN_ENV, Processes, Simulator, ancestors, booted_simulators, host_busy, host_cpu_ticks,
+    lock_holders, memory_gib, memory_signal, own_start, process_info, process_name, same_process, stop_processes,
     sweep_run, tagged_pids, yield_to_the_owner,
 )
 from gate_policy import Decision, Snapshot, decide, is_aged, number, queue_decision, run_workers
@@ -97,6 +105,10 @@ MAX_SWAPOUT_ENV = "AGENT_GATE_MAX_SWAPOUT_MBPS"
 PROBE_IMAGES_ENV = "AGENT_GATE_DOCKER_PROBE_IMAGES"
 #: How long a Docker claim must exceed what the VM could offer before it is refused.
 CEILING_ENV = "AGENT_GATE_DOCKER_CEILING_SECONDS"
+#: The memory one booted simulator takes, in GiB.
+SIMULATOR_GIB_ENV = "AGENT_GATE_SIMULATOR_GIB"
+#: Below this many GiB free on the disk that holds Docker's disk image, Docker runs are warned.
+DISK_FLOOR_ENV = "AGENT_GATE_DISK_FLOOR_GIB"
 
 #: The tokens a run without -c reserves: small, so other runs fit beside it. Its runners'
 #: fan-out is decided apart (gate_policy.fan_out) and is the whole machine when it runs alone.
@@ -111,6 +123,13 @@ DEFAULT_MAX_SWAPOUT_MBPS = 10.0
 #: Memory a build, a pull or a stopping container takes shows in no running container,
 #: so only a claim the VM falls short of at every survey this long is a configuration error.
 DEFAULT_CEILING_SECONDS = 300.0
+#: An idle simulator used 1.2-1.6 GiB on this kind of host.
+DEFAULT_SIMULATOR_GIB = 1.5
+#: How long a run's or a booted simulator's memory claim counts before the free share shows it.
+MEMORY_SETTLE_SECONDS = 60.0
+DEFAULT_DISK_FLOOR_GIB = 10.0
+#: Docker Desktop's disk image: a sparse file whose size is the disk limit set in Docker Desktop.
+DOCKER_RAW = Path("Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw")
 POLL_SECONDS = 0.25
 #: How often a waiter checks the request ahead of it, and collects dead gates' runs.
 WAITER_POLL_SECONDS = 0.5
@@ -241,6 +260,8 @@ class Settings:
         # so they may run beside a full pool.
         self.headroom = self._int(HEADROOM_ENV, max(1, self.tokens // 5), minimum=0)
         self.docker_ceiling = self._float(CEILING_ENV, DEFAULT_CEILING_SECONDS)
+        self.simulator_gib = self._float(SIMULATOR_GIB_ENV, DEFAULT_SIMULATOR_GIB)
+        self.disk_floor = self._float(DISK_FLOOR_ENV, DEFAULT_DISK_FLOOR_GIB)
         root = self.environ.get(DIR_ENV) or f"/tmp/agent-gate-{os.getuid()}"
         self.root = Path(root)
         self.waiters = self.root / "waiters"
@@ -255,6 +276,8 @@ class Settings:
         self.docker_waiters = self.docker / "waiters"
         self.docker_jobs = self.docker / "jobs"
         self.docker_vm = self.docker / "vm.json"
+        #: The sessions that booted each simulator: <UDID>.json.
+        self.simulators = self.root / "simulators"
         #: Present while admission control is off host-wide (`agent-gate off`).
         self.off = self.root / "off"
         images = (self.environ.get(PROBE_IMAGES_ENV) or "").replace(",", " ").split() or PROBE_IMAGES
@@ -280,7 +303,8 @@ class Settings:
         return finite(text, name)
 
     def ensure(self) -> None:
-        for path in (self.root, self.waiters, self.jobs, self.docker, self.docker_waiters, self.docker_jobs):
+        for path in (self.root, self.waiters, self.jobs, self.docker, self.docker_waiters, self.docker_jobs,
+                     self.simulators):
             with contextlib.suppress(FileExistsError):
                 os.mkdir(path, 0o700)
             info = os.lstat(path)
@@ -555,15 +579,27 @@ def _rotate(path: Path, fd: int) -> None:
 # ------------------------------------------------------------------ decisions
 
 
+def simulator_runs(settings: Settings) -> List[Dict[str, object]]:
+    """The booted simulators as runs: each holds 1 token, one runner and AGENT_GATE_SIMULATOR_GIB since it booted."""
+    return [{"id": f"simulator-{simulator.udid}", "simulator": simulator.udid, "label": f"simulator {simulator.name}",
+             "k": 1, "workers": 1, "mem_gib": settings.simulator_gib, "admitted": simulator.booted,
+             "pid": simulator.pid, "gate_alive": True, "held": True}
+            for simulator in booted_simulators(settings.environ)]
+
+
 def read_snapshot(settings: Settings, sweep: bool) -> Snapshot:
-    """The live runs and the memory signal now; with `sweep` (a queue head), dead gates' runs are collected first."""
-    jobs = scan_jobs(settings, sweep=sweep)
+    """The live runs, the booted simulators and the memory signal now; with `sweep` (a queue head), dead gates'
+    runs are collected first."""
+    jobs = scan_jobs(settings, sweep=sweep) + simulator_runs(settings)
     pressure, free, swapout = memory_signal(settings.environ, settings.swap_samples)
     try:
         since_admit = time.time() - settings.last_admit.stat().st_mtime
     except OSError:
         since_admit = float("inf")
-    return Snapshot(jobs, pressure, free, swapout, since_admit)
+    now = time.time()
+    pending = sum(number(job.get("mem_gib")) for job in jobs
+                  if now - number(job.get("admitted"), -math.inf) < MEMORY_SETTLE_SECONDS)
+    return Snapshot(jobs, pressure, free, swapout, since_admit, memory_gib(), pending)
 
 
 def enclosing_run(settings: Settings, environ: Mapping[str, str]) -> Optional[Dict[str, object]]:
@@ -788,6 +824,10 @@ class Progress:
             if running:
                 shown = ", ".join(f"{job.get('label') or job['id']} (k={job.get('k')})" for job in running[:4])
                 parts.append(f"running: {shown}")
+            now = time.time()
+            booted = [simulator_text(self.settings, job, now) for job in simulator_runs(self.settings)]
+            if booted:
+                parts.append(f"booted: {'; '.join(booted[:4])}")
         if self.reason:
             parts.append(f"waiting because {self.reason}")
         return "; ".join(parts)
@@ -841,8 +881,12 @@ def block_shared(path: str, deadline: Optional[float], idle: Callable[[], object
 
 class Request:
     def __init__(self, k: int, label: str, argv: Sequence[str], wait: Optional[float], timeout: float,
-                 asked: Optional[int] = None, docker_gib: float = 0.0, docker_frees: str = "", grow: bool = False):
+                 asked: Optional[int] = None, docker_gib: float = 0.0, docker_frees: str = "", grow: bool = False,
+                 simulators: int = 0, mem_gib: float = 0.0):
         self.k = k
+        #: Simulators the command boots, and the host memory they claim.
+        self.simulators = simulators
+        self.mem_gib = mem_gib
         self.asked = k if asked is None else asked
         #: A default claim (no -c): its runners get the CPUs no other run uses.
         self.grow = grow
@@ -880,7 +924,7 @@ def job_record(request: Request, tokens: bool = True, queued: Optional[float] = 
         "queued": round(time.time() if queued is None else queued, 3),
     }
     if tokens:
-        record.update(k=request.k, asked=request.asked)
+        record.update(k=request.k, asked=request.asked, mem_gib=request.mem_gib)
     return record
 
 
@@ -944,7 +988,7 @@ def admission(settings: Settings, request: Request, ticket: int,
     if held is not None:
         return held, len(ahead), None
     snapshot = read_snapshot(settings, sweep=sweep and not ahead)
-    decision = decide(snapshot, request.k, settings, ahead, time.time(), request.grow)
+    decision = decide(snapshot, request.k, settings, ahead, time.time(), request.grow, request.mem_gib)
     if not decision.starts and decision.reason:
         decision = Decision(decision.code, f"{decision.reason} ({snapshot.memory_text()})")
     return decision, len(ahead), snapshot
@@ -1081,6 +1125,101 @@ def release_docker(settings: Settings, request: Request) -> None:
     os.close(request.docker_fd)
     request.docker_fd = None
     _remove_unlocked(settings.docker_jobs / f"{request.id}.lock")
+
+
+def docker_disk(settings: Settings) -> Optional[Dict[str, float]]:
+    """Docker Desktop's disk image against the free space of its disk, in GiB; None without one.
+
+    Read from the file system only, so it costs nothing while Docker is stopped or wedged.
+    """
+    raw = Path(settings.environ.get("HOME") or Path.home()) / DOCKER_RAW
+    try:
+        info = raw.stat()
+        disk = os.statvfs(raw)
+    except OSError:
+        return None
+    used = info.st_blocks * 512 / GIB
+    limit = info.st_size / GIB
+    return {"used_gib": round(used, 2), "limit_gib": round(limit, 2), "room_gib": round(max(0.0, limit - used), 2),
+            "free_gib": round(disk.f_bavail * disk.f_frsize / GIB, 2)}
+
+
+def disk_warnings(settings: Settings, disk: Mapping[str, float]) -> List[str]:
+    """What threatens to fill the disk: little space left, or a Docker disk image that can outgrow it."""
+    warnings = []
+    if disk["free_gib"] < settings.disk_floor:
+        warnings.append(f"only {disk['free_gib']:.1f} GiB free on the disk that holds Docker's disk image, below "
+                        f"{settings.disk_floor:g} GiB ({DISK_FLOOR_ENV})")
+    if disk["room_gib"] > disk["free_gib"]:
+        warnings.append(f"Docker's disk image may still grow {disk['room_gib']:.1f} GiB and the disk has "
+                        f"{disk['free_gib']:.1f} GiB free: lower its limit in Docker Desktop (Settings > Resources > "
+                        f"Advanced; shrinking it recreates the image, deleting images, containers and volumes). "
+                        f"`docker system prune` only frees room inside the image for reuse")
+    return warnings
+
+
+def disk_text(settings: Settings, disk: Mapping[str, float]) -> List[str]:
+    return [f"Docker disk image: {disk['used_gib']:.1f} of {disk['limit_gib']:.0f} GiB used; "
+            f"{disk['free_gib']:.1f} GiB free on its disk"] + [f"  warning: {text}" for text in
+                                                                disk_warnings(settings, disk)]
+
+
+# ------------------------------------------------------------------ simulators
+
+
+def session_owners() -> List[Dict[str, object]]:
+    """The processes this gate runs for: its ancestors, up to but not including the app or service under launchd,
+    which outlives every session it starts."""
+    chain = list(ancestors().items())
+    if chain and (process_info(chain[-1][0]) or (0,))[0] == 1:
+        chain.pop()
+    return [{"pid": pid, "start": start, "name": process_name(pid)} for pid, start in chain]
+
+
+def simulator_record(settings: Settings, simulator: Simulator) -> Dict[str, object]:
+    """What the gate knows of who booted `simulator`; empty when no run recorded this boot of it."""
+    try:
+        record = json.loads((settings.simulators / f"{simulator.udid}.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    # A record of an earlier boot of the device says nothing about this one.
+    if not isinstance(record, dict) or abs(number(record.get("booted")) - simulator.booted) > 1:
+        return {}
+    return record
+
+
+def live_owner(settings: Settings, simulator: Simulator) -> Optional[Mapping[str, object]]:
+    """A recorded owner of `simulator` that is still running; None when none is."""
+    owners = simulator_record(settings, simulator).get("owners")
+    return next((owner for owner in owners if isinstance(owner, dict)
+                 and same_process(owner.get("pid"), owner.get("start"))), None) if isinstance(owners, list) else None
+
+
+def record_owners(settings: Settings, request: "Request", before: Iterable[str]) -> None:
+    """Record the processes this run ran for as owners of each simulator that booted while it ran."""
+    owners = session_owners()
+    booted = [simulator for simulator in booted_simulators(settings.environ) if simulator.udid not in set(before)]
+    if not owners or not booted:
+        return
+    with contextlib.suppress(OSError), exclusive(settings.simulators / "owners.lock"):
+        for simulator in booted:
+            record = simulator_record(settings, simulator) or {"udid": simulator.udid, "booted": simulator.booted,
+                                                               "owners": []}
+            known = record.get("owners") if isinstance(record.get("owners"), list) else []
+            record["owners"] = known + [dict(owner, label=request.label, cwd=os.getcwd(), at=round(time.time(), 3))
+                                        for owner in owners]
+            staging = settings.simulators / f".{simulator.udid}.json.tmp"
+            staging.write_text(json.dumps(record, sort_keys=True))
+            os.replace(staging, settings.simulators / f"{simulator.udid}.json")
+
+
+def simulator_text(settings: Settings, job: Mapping[str, object], now: float) -> str:
+    simulator = Simulator(str(job["simulator"]), str(job["label"]), number(job.get("admitted")), int(number(job["pid"])))
+    owner = live_owner(settings, simulator)
+    hours = (now - simulator.booted) / 3600
+    whose = f"booted by {owner['name']} (pid {owner['pid']}), still running" if owner else \
+        "no live owner on record; `agent-gate janitor` reports whether it may go"
+    return f"{job['label']}, booted {hours:.1f}h ago: {whose}"
 
 
 # ------------------------------------------------------------------ running
@@ -1234,6 +1373,8 @@ def run_admitted(
                 "held_s": round(time.monotonic() - began, 3), **outcome,
             })
 
+        # Which simulators were up before, so the ones the command boots, itself or in a nested run, get owners.
+        before = [simulator.udid for simulator in booted_simulators(settings.environ)]
         stopped = stops.before_start()
         if stopped is not None:
             # Stopped before it started: nothing runs, as when stopped while queued.
@@ -1254,6 +1395,7 @@ def run_admitted(
 
         used, watched = supervise(settings, request, child, record, began, stops)
         held = time.monotonic() - began
+        record_owners(settings, request, before)
         busy = host_busy(host_before, host_cpu_ticks())
         swept, survivors = sweep_run(run_id)
         # Survivors keep the run's tokens: its record stays for the queue head to collect.
@@ -1396,6 +1538,9 @@ def run(argv: Sequence[str], environ: Optional[Mapping[str, str]] = None) -> int
                         help="memory the command's containers need in the Docker VM, in GiB")
     parser.add_argument("--docker-frees", default="", metavar="PROJECT",
                         help="a compose project the command stops first; what it uses counts as available")
+    parser.add_argument("--simulators", default="0", metavar="N",
+                        help=f"simulators the command boots; each claims {SIMULATOR_GIB_ENV} of memory "
+                             f"(default {DEFAULT_SIMULATOR_GIB:g} GiB)")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--wait", default=None, help="give up after SECS in the queue (exit 75)")
     group.add_argument("--no-wait", action="store_true", help="exit 75 unless admitted at once")
@@ -1415,6 +1560,9 @@ def run(argv: Sequence[str], environ: Optional[Mapping[str, str]] = None) -> int
         docker_gib = finite(args.docker_gib, "--docker-gib")
         if args.docker_frees and not docker_gib:
             raise ConfigError("--docker-frees needs --docker-gib")
+        simulators = finite(args.simulators, "--simulators")
+        if simulators != int(simulators):
+            raise ConfigError(f"--simulators {args.simulators!r} is not a whole number")
         wait = 0.0 if args.no_wait else None if args.wait is None else finite(args.wait, "--wait")
         timeout = finite(args.timeout, "--timeout")
         if settings.off.exists():
@@ -1438,7 +1586,12 @@ def run(argv: Sequence[str], environ: Optional[Mapping[str, str]] = None) -> int
                              "asked": asked, "docker_gib": docker_gib, "cwd": os.getcwd()})
         return execute(command, runner_environment(environ, budget, str(parent["id"])))
 
-    request = Request(k, label, command, wait, timeout, asked, docker_gib, args.docker_frees, grow=args.cpus is None)
+    request = Request(k, label, command, wait, timeout, asked, docker_gib, args.docker_frees, grow=args.cpus is None,
+                      simulators=int(simulators), mem_gib=simulators * settings.simulator_gib)
+    disk = docker_disk(settings) if docker_gib else None
+    if disk is not None and disk["free_gib"] < settings.disk_floor:
+        for warning in disk_warnings(settings, disk):
+            say(f"warning: {warning}")
 
     def not_admitted(reason: str, code: int) -> int:
         log_event(settings, {"event": "not-admitted", "id": request.id, "label": label, "reason": reason,
@@ -1539,9 +1692,12 @@ def status(argv: Sequence[str], environ: Optional[Mapping[str, str]] = None) -> 
     # the headroom hold all T tokens.
     aged = [waiter for waiter in waiters if is_aged(waiter, settings, now)]
     reserved = sum(number(waiter.get("k")) for waiter in aged)
+    disk = docker_disk(settings)
     if args.json:
         print(json.dumps({
-            "docker": {"vm": vm, "reserved": docker_reserved, "waiting": docker_waiting},
+            "docker": {"vm": vm, "reserved": docker_reserved, "waiting": docker_waiting, "disk": disk,
+                       "disk_warnings": [] if disk is None else disk_warnings(settings, disk)},
+            "pending_gib": snapshot.pending_gib,
             "tokens": settings.tokens,
             "headroom": settings.headroom,
             "used": snapshot.used,
@@ -1573,6 +1729,9 @@ def status(argv: Sequence[str], environ: Optional[Mapping[str, str]] = None) -> 
               f"only a 1-token run into the headroom passes them, while runs outside it hold all "
               f"{settings.tokens} tokens ({snapshot.outside_headroom:g} now)")
     for job in snapshot.jobs:
+        if "simulator" in job:
+            print(f"  booted  k=1 {simulator_text(settings, job, now)}")
+            continue
         age = now - number(job.get("admitted"), now)
         note = "" if job["gate_alive"] else "  [gate gone: orphaned]" if job["held"] else "  [gate gone: leftovers]"
         print(f"  running k={job.get('k')} x{run_workers(job):g} workers {age:6.0f}s  {job.get('label')}  "
@@ -1597,6 +1756,8 @@ def status(argv: Sequence[str], environ: Optional[Mapping[str, str]] = None) -> 
             age_s = now - number(waiter.get("queued"), now)
             print(f"  queued #{position} {number(waiter.get('docker_gib')):g} GiB {age_s:6.0f}s  "
                   f"{waiter.get('label')}  {waiter.get('cwd')}")
+    if disk is not None:
+        print("\n".join(disk_text(settings, disk)))
     return 0
 
 
@@ -1726,6 +1887,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return inside(argv[1:])
     if argv[:1] == ["usage"]:
         return usage(argv[1:])
+    if argv[:1] == ["janitor"]:
+        import gate_janitor
+        return gate_janitor.main(argv[1:])
     if argv in (["on"], ["off"]):
         return switch(argv == ["on"])
     return run(argv)

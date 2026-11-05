@@ -29,7 +29,8 @@ import sys
 from typing import List, Mapping, Optional, Sequence, Tuple
 
 #: The tools whose entry points the shims take over; each links to `_devshim`.
-TOOLS = ("bun", "make", "npm", "npx", "playwright", "pnpm", "poetry", "pytest", "uv", "vitest", "yarn")
+TOOLS = ("bun", "docker", "make", "npm", "npx", "playwright", "pnpm", "poetry", "pytest", "uv", "vitest", "xcodebuild",
+         "xcrun", "yarn")
 SHIM_DIR = Path(".local/devshims")
 SHIM_BODY = "_devshim"
 #: What a process starts with before any startup file runs.

@@ -896,6 +896,68 @@ PAUSE_GATE = textwrap.dedent(
 )
 
 
+class SimulatorTest(GateCase):
+    """Booted simulators hold a token each, and runs that boot them claim the memory they will take."""
+
+    def boot(self, free: int, *ages: float) -> None:
+        """Free memory at `free` percent, with a simulator booted `age` seconds ago for each age."""
+        now = time.time()
+        lines = [f"1 {free}"] + [f"simulator UDID-{index} {now - age} Phone {index}" for index, age in enumerate(ages)]
+        self.set_memory("\n".join(lines))
+
+    def claim(self, *args: object) -> Result:
+        # A simulator takes a fifth of this host's usable memory, whatever its size.
+        self.env["AGENT_GATE_SIMULATOR_GIB"] = str(gate_macos.memory_gib() / 5)
+        return self.gate("--no-wait", *args, "--", PY, "-c", "pass")
+
+    def test_booted_simulators_hold_tokens_and_narrow_a_default_runs_fan_out(self):
+        self.boot(80, 3600, 3600)
+        result = self.gate("--", PY, "-c", "import os; print(os.environ['AGENT_GATE_CPUS'])")
+        self.assertEqual(result.out.split(), ["2"], result.err)
+        self.assertEqual(self.gate("--no-wait", "-c", 3, "--", "true").code, agent_gate.NOT_ADMITTED_EXIT)
+        self.assertIn("simulator Phone 0", self.status_text())
+
+    def test_a_simulator_claim_waits_beside_other_work_and_starts_alone(self):
+        self.boot(40)
+        self.assertEqual(self.claim("-c", 1, "--simulators", 1).code, 0, "alone it starts")
+        blocker = self.holding("blocker", 1)
+        result = self.claim("-c", 1, "--simulators", 1)
+        self.assertEqual(result.code, agent_gate.NOT_ADMITTED_EXIT)
+        self.assertIn("would leave 20% memory free", result.err)
+        self.assertEqual(self.claim("-c", 1).code, 0, "a run that boots none passes")
+        self.boot(50)
+        self.assertEqual(self.claim("-c", 1, "--simulators", 1).code, 0)
+        self.end(blocker)
+
+    def test_a_simulator_booted_moments_ago_counts_memory_the_free_share_does_not_show_yet(self):
+        self.boot(40, 5)
+        result = self.claim("-c", 2)
+        self.assertEqual(result.code, agent_gate.NOT_ADMITTED_EXIT)
+        self.assertIn("once recent claims show", result.err)
+        self.boot(40, 120)
+        self.assertEqual(self.claim("-c", 2).code, 0)
+
+
+class DockerDiskTest(GateCase):
+    def test_status_warns_while_dockers_disk_image_can_outgrow_the_free_disk(self):
+        home = self.tmp / "home"
+        raw = home / agent_gate.DOCKER_RAW
+        raw.parent.mkdir(parents=True)
+        with open(raw, "wb") as handle:
+            handle.truncate(2**50)  # sparse: a limit far beyond any free disk, nothing used
+        self.env["HOME"] = str(home)
+        disk = self.status()["docker"]["disk"]
+        self.assertEqual(disk["limit_gib"], 2**20)
+        self.assertLess(disk["used_gib"], 1)
+        text = self.status_text()
+        self.assertIn("Docker disk image: 0.0 of 1048576 GiB used", text)
+        self.assertIn("lower its limit in Docker Desktop", text)
+        self.env["AGENT_GATE_DISK_FLOOR_GIB"] = str(disk["free_gib"] + 1)
+        self.assertIn("below", self.status_text())
+        raw.unlink()
+        self.assertIsNone(self.status()["docker"]["disk"])
+
+
 class BackfillTest(GateCase):
     """Later requests start beside earlier ones that wait for tokens; 1-token runs have headroom."""
 
