@@ -22,6 +22,7 @@ from gate_host import TOOLS  # noqa: E402
 # needs an entry here, and devshim has to classify it as heavy.
 TEST_VERB = {
     "bun": ("bun", "test"),
+    "docker": ("docker", "compose", "build"),
     "make": ("make", "test"),
     "npm": ("npm", "test"),
     "npx": ("npx", "vitest", "run"),
@@ -31,6 +32,8 @@ TEST_VERB = {
     "pytest": ("pytest",),
     "uv": ("uv", "run", "pytest"),
     "vitest": ("vitest", "run"),
+    "xcodebuild": ("xcodebuild", "test"),
+    "xcrun": ("xcrun", "simctl", "boot", "iPhone 17"),
     "yarn": ("yarn", "test"),
 }
 
@@ -505,6 +508,105 @@ class DevshimTest(unittest.TestCase):
             ["npm", "run", "check"],
             ["poetry", "run", "check"],
         ))
+
+    def claims(self, command: Sequence[str]) -> str:
+        result = self.fixture.run(command)
+        for word in result.stdout.split():
+            if word.startswith("claims="):
+                return word[len("claims="):].replace(",", " ")
+        raise AssertionError(f"{command}: no claims in {result.stdout!r} {result.stderr!r}")
+
+    def test_docker_builds_claim_memory_in_the_docker_vm(self):
+        builds = (
+            ["docker", "build", "."],
+            ["docker", "--context", "desktop-linux", "image", "build", "-t", "x", "."],
+            ["docker", "builder", "build", "."],
+            ["docker", "buildx", "--builder", "b", "bake"],
+            ["docker", "buildx", "build", "-f", "Dockerfile", "."],
+            ["docker", "compose", "-f", "build.yml", "-p", "build", "build", "api"],
+        )
+        self.assertDecisions("gate", builds)
+        for command in builds:
+            with self.subTest(command=" ".join(command)):
+                self.assertEqual(self.claims(command), "--docker-gib 1.5")
+        self.assertEqual(self.fixture.run(["docker", "build", "."], AGENT_GATE_DOCKER_BUILD_GIB="3").stdout.split()[-2],
+                         "claims=--docker-gib,3")
+        self.assertDecisions("direct", (
+            ["docker", "ps"],
+            ["docker", "run", "--rm", "alpine", "build"],
+            ["docker", "compose", "up", "--build"],
+            ["docker", "compose", "-f", "build.yml", "logs"],
+            ["docker", "buildx", "bake", "--print"],
+            ["docker", "build", "--help"],
+            ["docker", "image", "ls"],
+        ))
+
+    def test_xcodebuild_builds_and_tests_take_the_gate_and_queries_run_directly(self):
+        self.assertDecisions("gate", (
+            ["xcodebuild"],
+            ["xcodebuild", "-scheme", "App", "build"],
+            ["xcodebuild", "-scheme", "App", "clean", "build"],
+            ["xcodebuild", "-workspace", "A.xcworkspace", "-scheme", "App", "-quiet", "test"],
+            ["xcodebuild", "archive", "-scheme", "App"],
+            ["xcodebuild", "-scheme", "App", "CODE_SIGNING_ALLOWED=NO"],
+            ["xcrun", "xcodebuild", "-scheme", "App", "test-without-building"],
+        ))
+        self.assertDecisions("direct", (
+            ["xcodebuild", "-list"],
+            ["xcodebuild", "-scheme", "test", "-showBuildSettings"],
+            ["xcodebuild", "-version"],
+            ["xcodebuild", "-scheme", "App", "clean"],
+            ["xcodebuild", "-resolvePackageDependencies", "-scheme", "App"],
+            ["xcodebuild", "-scheme", "App", "-enumerate-tests", "test"],
+            ["xcodebuild", "-downloadPlatform", "iOS"],
+        ))
+
+    def test_xcodebuild_tests_claim_the_simulators_they_boot(self):
+        self.assertEqual(self.claims(["xcodebuild", "-scheme", "App", "build"]), "none")
+        self.assertEqual(self.claims(["xcodebuild", "-scheme", "App", "test"]), "--simulators 1")
+        self.assertEqual(self.claims([
+            "xcodebuild", "test", "-scheme", "App",
+            "-destination", "platform=iOS Simulator,name=iPhone 17",
+            "-destination", "platform=iOS Simulator,name=iPad Air",
+        ]), "--simulators 2")
+        self.assertEqual(self.claims(["xcodebuild", "test", "-destination", "id=1234-ABCD"]), "--simulators 1")
+        self.assertEqual(self.claims(["xcodebuild", "test", "-destination", "platform=macOS"]), "none")
+        # Parallel testing boots a clone per test runner.
+        self.assertEqual(self.claims(["xcodebuild", "test", "-parallel-testing-worker-count", "3"]), "--simulators 3")
+        self.assertEqual(self.claims(["xcodebuild", "test", "-parallel-testing-enabled", "NO"]), "--simulators 1")
+        # Defaults given as -name=value take no next word.
+        self.assertEqual(self.claims(["xcodebuild", "-IDEPackageSupportUseBuiltinSCM=YES", "test"]), "--simulators 1")
+
+    def test_xcrun_boots_claim_one_simulator_and_other_calls_run_directly(self):
+        self.assertDecisions("gate", (
+            ["xcrun", "simctl", "boot", "iPhone 17"],
+            ["xcrun", "--sdk", "iphonesimulator", "simctl", "--set", "boot", "boot", "X"],
+            ["xcrun", "simctl", "bootstatus", "X", "-b"],
+        ))
+        self.assertEqual(self.claims(["xcrun", "simctl", "boot", "X"]), "-c 1 --simulators 1")
+        self.assertDecisions("direct", (
+            ["xcrun", "--find", "clang"],
+            ["xcrun", "--show-sdk-path"],
+            ["xcrun", "clang", "-c", "boot.c"],
+            ["xcrun", "simctl", "list", "devices", "boot"],
+            ["xcrun", "simctl", "bootstatus", "X"],
+            ["xcrun", "simctl", "shutdown", "all"],
+        ))
+
+    def test_xcodebuild_operations_follow_the_grant_and_the_claim_unless_the_caller_set_them(self):
+        fake = self.fixture.real / "xcodebuild"
+        fake.write_text('#!/bin/sh\necho "$*"\n')
+        result = self.fixture.run(["xcodebuild", "-scheme", "App", "build"], explain=False)
+        # Alone on the fixture's 4 tokens, a default claim gets every CPU.
+        self.assertEqual(result.stdout.strip(), "-scheme App build -jobs 4", result.stderr)
+        result = self.fixture.run(["xcodebuild", "-jobs", "2", "build"], explain=False)
+        self.assertEqual(result.stdout.strip(), "-jobs 2 build", result.stderr)
+        # Tests boot as many simulators as they claim: one per destination unless the caller says otherwise.
+        result = self.fixture.run(["xcodebuild", "-jobs", "2", "test"], explain=False)
+        self.assertEqual(result.stdout.strip(), "-jobs 2 test -maximum-parallel-testing-workers 1", result.stderr)
+        result = self.fixture.run(["xcodebuild", "-jobs", "2", "test", "-maximum-parallel-testing-workers", "2"],
+                                  explain=False)
+        self.assertEqual(result.stdout.strip(), "-jobs 2 test -maximum-parallel-testing-workers 2", result.stderr)
 
     def test_the_gate_runs_the_real_tool_with_its_budget(self):
         result = self.fixture.run(["npm", "test"], explain=False)
